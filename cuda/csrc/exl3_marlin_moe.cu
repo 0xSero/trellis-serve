@@ -133,7 +133,8 @@ static void gemm_launch(const half* a_ptr, const int* b_ptr, half* c_ptr, const 
                         const int* expert_ids, const int* num_post_padded, int moe_block_size, int rows, int n, int k,
                         int shard_end, int cb, int bits, int device, cudaStream_t stream, int force_thread_k,
                         int force_thread_n, int scratch, const int64_t* b_ptrs = nullptr,
-                        const int64_t* s_ptrs = nullptr, int ptr_stride = 0, int ptr_rows = 0) {
+                        const int64_t* s_ptrs = nullptr, int ptr_stride = 0, int ptr_rows = 0,
+                        const int64_t* wb_ptrs = nullptr) {
   DevState& st = dev_state(device);
   const int thread_m_blocks = (moe_block_size + 15) / 16;
   const bool m8 = moe_block_size == 8;
@@ -197,7 +198,7 @@ static void gemm_launch(const half* a_ptr, const int* b_ptr, half* c_ptr, const 
       sorted_ids, expert_ids, num_post_padded, nullptr, /*top_k=*/1, /*mul_topk_weights=*/false,
       /*num_groups=*/-1, rows, n, k, (int*)st.locks[scratch].data_ptr(), /*has_bias=*/false, /*use_atomic_add=*/false,
       /*use_fp32_reduce=*/true, a_shard_stride, shard_end > 0 ? shard_end : INT_MAX, INT_MAX, INT_MAX, out_flags,
-      b_ptrs, s_ptrs, ptr_stride, ptr_rows);
+      b_ptrs, s_ptrs, ptr_stride, ptr_rows, wb_ptrs);
   // clang-format on
 }
 
@@ -523,11 +524,17 @@ void moe_glu_had_in_ptr(const at::Tensor& gu, const at::Tensor& ptrs, int64_t fi
 void moe_gemm_ptr(const at::Tensor& a, at::Tensor& c, const at::Tensor& ptrs, int64_t field_b, int64_t field_s,
                   int64_t bits, const at::Tensor& sorted_ids, const at::Tensor& expert_ids,
                   const at::Tensor& num_post_padded, int64_t moe_block_size, int64_t shard_end, int64_t cb,
-                  int64_t thread_k, int64_t thread_n, int64_t scratch) {
+                  int64_t thread_k, int64_t thread_n, int64_t scratch, const c10::optional<at::Tensor>& wb) {
   const at::cuda::OptionalCUDAGuard device_guard(a.device());
   TORCH_CHECK(a.dim() == 2 && c.dim() == 2 && a.dtype() == at::kHalf && c.dtype() == at::kHalf);
   TORCH_CHECK(a.is_contiguous() && c.is_contiguous());
   check_ptrs(ptrs, field_b);
+  const int64_t* wb_ptr = nullptr;
+  if (wb.has_value()) {
+    check_ptrs(*wb, field_b);
+    TORCH_CHECK(wb->sizes() == ptrs.sizes(), "wb table must have the table's shape");
+    wb_ptr = wb->data_ptr<int64_t>() + field_b;
+  }
   TORCH_CHECK(field_s < ptrs.size(1));
   TORCH_CHECK(bits == 3 || bits == 4, "pointer-table GEMM: K = 3 or 4");
   const int64_t rows = c.size(0), k = a.size(1), n = c.size(1), shards = shard_end > 0 ? 2 : 1;
@@ -552,7 +559,32 @@ void moe_gemm_ptr(const at::Tensor& a, at::Tensor& c, const at::Tensor& ptrs, in
                                       (const int*)num_post_padded.data_ptr(), (int)moe_block_size, (int)rows, (int)n,
                                       (int)k, (int)shard_end, (int)cb, (int)bits, a.get_device(), stream, (int)thread_k,
                                       (int)thread_n, (int)scratch, tb + field_b, field_s >= 0 ? tb + field_s : nullptr,
-                                      (int)ptrs.size(1), (int)ptrs.size(0));
+                                      (int)ptrs.size(1), (int)ptrs.size(0), wb_ptr);
+}
+
+// Fused admission, small fields: for every routed slot with a valid id e and dst[e, field] != 0, copy nbytes
+// (multiple of 16) from src[e, field] to dst[e, field]. Duplicate ids copy the same bytes twice (benign).
+__global__ void trellis_moe_copy_fields_kernel(const int64_t* __restrict__ src, const int64_t* __restrict__ dst,
+                                               const void* __restrict__ ids, bool ids64, int stride, int rows,
+                                               int field, int n16) {
+  const int slot = blockIdx.x;
+  const int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
+  if (e < 0 || e >= rows) return;
+  int4* d = reinterpret_cast<int4*>(dst[e * stride + field]);
+  if (d == nullptr) return;
+  const int4* s = reinterpret_cast<const int4*>(src[e * stride + field]);
+  for (int i = threadIdx.x; i < n16; i += blockDim.x) d[i] = s[i];
+}
+
+void moe_copy_fields(const at::Tensor& src, const at::Tensor& dst, const at::Tensor& ids, int64_t field, int64_t nbytes) {
+  const at::cuda::OptionalCUDAGuard device_guard(src.device());
+  check_ptrs(src, field);
+  check_ptrs(dst, field);
+  TORCH_CHECK(src.sizes() == dst.sizes() && is_index(ids) && ids.is_contiguous() && nbytes % 16 == 0 && nbytes > 0);
+  if (ids.numel() == 0) return;
+  trellis_moe_copy_fields_kernel<<<(unsigned)ids.numel(), 256, 0, at::cuda::getCurrentCUDAStream().stream()>>>(
+      src.data_ptr<int64_t>(), dst.data_ptr<int64_t>(), ids.data_ptr(), ids.dtype() == at::kLong, (int)src.size(1),
+      (int)src.size(0), (int)field, (int)(nbytes / 16));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -745,7 +777,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_gemm_ptr", &moe_gemm_ptr, "grouped EXL3 GEMM, experts addressed through an int64 pointer table [E, F]",
         py::arg("a"), py::arg("c"), py::arg("ptrs"), py::arg("field_b"), py::arg("field_s"), py::arg("bits"),
         py::arg("sorted_ids"), py::arg("expert_ids"), py::arg("num_post_padded"), py::arg("moe_block_size"),
-        py::arg("shard_end"), py::arg("cb"), py::arg("thread_k") = -1, py::arg("thread_n") = -1, py::arg("scratch") = 0);
+        py::arg("shard_end"), py::arg("cb"), py::arg("thread_k") = -1, py::arg("thread_n") = -1, py::arg("scratch") = 0,
+        py::arg("wb") = py::none());
+  m.def("moe_copy_fields", &moe_copy_fields, "per routed slot: copy nbytes from src[e, field] to dst[e, field] where dst != 0",
+        py::arg("src"), py::arg("dst"), py::arg("ids"), py::arg("field"), py::arg("nbytes"));
   m.def("moe_had_in_ptr", &moe_had_in_ptr, "moe_had_in with suh from the pointer table",
         py::arg("x"), py::arg("ptrs"), py::arg("field"), py::arg("shards"), py::arg("ids"), py::arg("xh"));
   m.def("moe_glu_had_in_ptr", &moe_glu_had_in_ptr, "moe_glu_had_in with suh_down from the pointer table",

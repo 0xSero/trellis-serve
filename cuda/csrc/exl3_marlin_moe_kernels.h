@@ -25,7 +25,8 @@
       int num_groups, int prob_m, int prob_n, int prob_k, int *locks, bool has_bias,      \
       bool use_atomic_add, bool use_fp32_reduce, int a_shard_stride, int shard_end0,      \
       int shard_end1, int shard_end2, int out_flags,                                     \
-      const int64_t *__restrict__ b_ptrs, const int64_t *__restrict__ s_ptrs, int ptr_stride, int ptr_rows
+      const int64_t *__restrict__ b_ptrs, const int64_t *__restrict__ s_ptrs, int ptr_stride, int ptr_rows, \
+      const int64_t *__restrict__ wb_ptrs
 
 namespace MARLIN_NAMESPACE_NAME {
 

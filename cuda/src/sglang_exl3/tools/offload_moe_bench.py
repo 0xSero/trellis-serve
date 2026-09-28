@@ -367,6 +367,80 @@ def check_masked(L: Layer, gen) -> dict:
     return out
 
 
+def check_and_bench_admit(L: Layer, gen, reps: int) -> dict:
+    """Fused admission: zero-copy misses written into cache slots by the GEMMs themselves.
+    Correctness: output == stacked; every admitted slot's record == the host record byte for byte; re-pointing the
+    table to the slots gives the same output again. Timing: graph-replayed 1-token decode, all 10 experts host +
+    admitted, vs the same without admission."""
+    res = {}
+    arena = torch.zeros((L.e, L.lay.record_bytes), dtype=torch.uint8, device="cuda")
+    admit = offload_moe.new_table(L.e)
+    ok_all = True
+    for tokens, host_frac in ((1, 1.0), (8, 1.0), (16, 0.5), (64, 1.0)):
+        ids, w = uniform_routing(tokens, 10, L.e, gen)
+        x = (torch.randn((tokens, L.hidden), generator=gen) * 0.5).to(torch.bfloat16).cuda()
+        u = ids.reshape(-1).unique().long()
+        host_mask = torch.zeros(L.e, dtype=torch.bool, device="cuda")
+        host_mask[u[torch.randperm(u.numel(), generator=gen)[: int(round(u.numel() * host_frac))].cuda()]] = True
+        L.set_table("mixed", host_mask)
+        adm = u[host_mask[u]]                                            # admit exactly the host-resident routed experts
+        arena.zero_()
+        dst = torch.zeros(L.e, dtype=torch.int64, device="cuda")
+        dst[adm] = arena.data_ptr() + torch.arange(adm.numel(), device="cuda") * L.lay.record_bytes
+        offload_moe.fill_admit_(admit, dst, L.offs)
+        block = marlin_moe.moe_block_size(tokens, 10, L.e)
+        y = offload_moe.run(x, w, ids, *align(ids, block, L.e), block, L.table, L.lay, L.cb, admit=admit)
+        ys = L.run_stack(x, ids, w)
+        rec_ok = all(torch.equal(arena[i].cpu(), L.host[int(e)]) for i, e in enumerate(adm.tolist()))
+        # untouched slots stay zero
+        rest_zero = bool((arena[adm.numel():] == 0).all())
+        # now serve the admitted experts from their slots
+        bases = torch.where(host_mask, L.bases_host, L.bases_dev)
+        bases[adm] = dst[adm]
+        offload_moe.fill_table_(L.table, bases, L.offs)
+        y2 = L.run_ptr(x, ids, w)
+        r = {"eq_stacked": eq16(y, ys), "admitted": int(adm.numel()), "records_exact": bool(rec_ok),
+             "other_slots_untouched": rest_zero, "from_slots_eq_stacked": eq16(y2, ys)}
+        ok_all &= all(v for k, v in r.items() if k != "admitted")
+        res[f"{tokens}tok_host{host_frac}"] = r
+        print("admit", tokens, r, flush=True)
+    res["pass"] = bool(ok_all)
+    # timing: 1 token, all 10 host, admission on vs off
+    for use_admit in (False, True):
+        tokens = 1
+        ids, w = uniform_routing(tokens, 10, L.e, gen)
+        x = (torch.randn((tokens, L.hidden), generator=gen) * 0.5).to(torch.bfloat16).cuda()
+        L.set_table("host")
+        admit.zero_()
+        block = marlin_moe.moe_block_size(tokens, 10, L.e)
+        fn = lambda: offload_moe.run(x, w, ids, *align(ids, block, L.e), block, L.table, L.lay, L.cb,
+                                     admit=admit if use_admit else None)
+        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            fn(); fn()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fn()
+        ts = []
+        ar10 = torch.arange(10, device="cuda")
+        for i in range(reps + 5):
+            r_ids, r_w = uniform_routing(tokens, 10, L.e, gen)
+            ids.copy_(r_ids); w.copy_(r_w)
+            if use_admit:
+                dst = torch.zeros(L.e, dtype=torch.int64, device="cuda")
+                dst[r_ids.reshape(-1).long()] = arena.data_ptr() + ((i % 20) * 10 + ar10) * L.lay.record_bytes
+                offload_moe.fill_admit_(admit, dst, L.offs)
+            torch.cuda.synchronize()
+            a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            a.record(); g.replay(); b.record(); torch.cuda.synchronize()
+            if i >= 5:
+                ts.append(a.elapsed_time(b) * 1000)
+        res[f"decode1_host_admit{int(use_admit)}_median_us"] = median_ms(ts)
+        print("admit timing", use_admit, median_ms(ts), flush=True)
+    return res
+
+
 def bench_gather_then_compute(L: Layer, gen, reps: int) -> dict:
     """1-token decode, all 10 experts miss: graph-safe copy-in (SM gather of the 10 host records into cache slots by
     torch.index_select on the mapped bank, table rows re-pointed on device) followed by the device-resident layer."""
@@ -443,6 +517,15 @@ def main():
         r = check_masked(L, gen)
         if a.json:
             json.dump({"masked": r}, open(a.json.replace(".json", "_masked.json"), "w"), indent=1)
+    if "admit" in only:
+        r = check_and_bench_admit(L, gen, a.reps)
+        print("ADMIT", "PASS" if r["pass"] else "FAIL", flush=True)
+        if a.json:
+            json.dump({"admit": r}, open(a.json.replace(".json", "_admit.json"), "w"), indent=1)
+    if "decode" in only:
+        for tokens in [int(t) for t in a.decode_tokens.split(",") if t]:
+            for where in ("device", "host", "mixed"):
+                print("decode", bench_decode(L, gen, tokens, where, a.reps), flush=True)
     if "gather" in only:
         r = bench_gather_then_compute(L, gen, a.reps)
         print("gather_then_compute", r, flush=True)

@@ -120,10 +120,22 @@ def slot_bases(slot_of_expert: torch.Tensor, arena_base: int, host_base: int, re
     return torch.where(s >= 0, arena_base + s * record_bytes, host_base + e * record_bytes)
 
 
+def fill_admit_(wb: torch.Tensor, dst_bases: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """Admission table for `run(..., admit=wb)`: row e = expert e's record fields in its DESTINATION slot, or all 0
+    (no admission) where dst_bases[e] == 0. In place, device op (graph-capturable)."""
+    torch.where((dst_bases != 0).unsqueeze(1), dst_bases.unsqueeze(1) + offsets.unsqueeze(0),
+                torch.zeros((), dtype=torch.int64, device=wb.device), out=wb)
+    return wb
+
+
 def run(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, block: int, table: torch.Tensor,
-        lay: RecordLayout, codebook: int, out: torch.Tensor | None = None) -> torch.Tensor:
+        lay: RecordLayout, codebook: int, out: torch.Tensor | None = None, admit: torch.Tensor | None = None) -> torch.Tensor:
     """x fp16 | bf16 [T, H]; topk_weights fp32 [T, top_k]; topk_ids int32 | int64 [T, top_k] (logical ids);
-    sorted_ids / expert_ids / num_post_padded = moe_align_block_size(topk_ids, block, E); table int64 [E, 6]."""
+    sorted_ids / expert_ids / num_post_padded = moe_align_block_size(topk_ids, block, E); table int64 [E, 6].
+    admit (optional, int64 [E, 6], see fill_admit_): fused admission - every routed expert with a nonzero admit row is
+    also written to that destination record while it is computed (the B tiles from the GEMMs' shared-memory stages, the
+    small fields by one copy launch), e.g. zero-copy misses into their victim cache slots. The caller re-points the
+    table rows afterwards (stream order) and must not route an expert whose record is being overwritten."""
     mod = _mod()
     tokens, hidden = x.shape
     top_k, inter = topk_ids.shape[1], lay.inter
@@ -133,13 +145,16 @@ def run(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, bloc
         return y
     f16 = dict(dtype=torch.float16, device=x.device)
     xh = torch.empty((2 * slots, hidden), **f16)
+    if admit is not None:   # small fields = the contiguous record tail (suh13 .. svh2)
+        mod.moe_copy_fields(table, admit, topk_ids, F_SUH13, lay.record_bytes - lay.offsets[F_SUH13])
     mod.moe_had_in_ptr(x, table, F_SUH13, 2, topk_ids, xh)
     gu = torch.empty((slots, 2 * inter), **f16)
     cb = codebook
-    mod.moe_gemm_ptr(xh, gu, table, F_W13, F_SVH13, lay.bits, sorted_ids, expert_ids, num_post_padded, block, inter, cb)
+    mod.moe_gemm_ptr(xh, gu, table, F_W13, F_SVH13, lay.bits, sorted_ids, expert_ids, num_post_padded, block, inter, cb,
+                     wb=admit)
     act, xd = torch.empty((slots, inter), **f16), torch.empty((slots, inter), **f16)
     mod.moe_glu_had_in_ptr(gu, table, F_SUH2, topk_ids, act, xd)
     yd = xh[:slots]
-    mod.moe_gemm_ptr(xd, yd, table, F_W2, F_SVH2, lay.bits, sorted_ids, expert_ids, num_post_padded, block, 0, cb)
+    mod.moe_gemm_ptr(xd, yd, table, F_W2, F_SVH2, lay.bits, sorted_ids, expert_ids, num_post_padded, block, 0, cb, wb=admit)
     mod.moe_combine(yd, topk_weights, topk_ids, table.shape[0], y)
     return y
