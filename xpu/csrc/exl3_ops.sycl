@@ -180,7 +180,10 @@ static int g_target_threads_mb64 = 2048;
 
 // Column-strip width (tiles per thread) per case, from bench sweeps on B70:
 // K=4 M=1 -> 8 (longer contiguous reads), K=4 M=2..4 -> 4, K=6 -> 4 (two 32-lane tile pairs), M=8 -> 2.
-constexpr int nt_of(int K, int MR) { return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
+// K=3/5 (gcd(K,32)=1): 8 lanes per tile, GemvKernel pairs 4 tiles per vector op -> NT >= 4.
+constexpr int tp_of(int K) { return (256 / (32 / cgcd(K, 32))) >= 32 ? 1 : 32 / (256 / (32 / cgcd(K, 32))); }
+constexpr int nt_raw(int K, int MR) { return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
+constexpr int nt_of(int K, int MR) { return nt_raw(K, MR) < tp_of(K) ? tp_of(K) : nt_raw(K, MR); }
 static int nt_for(int K, int MR) { return nt_of(K, MR); }
 
 template <int K, int CB>
@@ -303,9 +306,9 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
 #define EXL3_CASE(KK, CC) \
     if (K == KK && cb == CC) ok = use_vec ? dispatch_mr<KK, CC>(MR, xh, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q) \
                                           : dispatch_dpas<KK, CC>(MB, xh, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
-    EXL3_CASE(4, 2) EXL3_CASE(6, 2)
+    EXL3_CASE(3, 2) EXL3_CASE(4, 2) EXL3_CASE(6, 2)
 #ifdef EXL3_ALL_CODEBOOKS
-    EXL3_CASE(2, 2) EXL3_CASE(3, 2) EXL3_CASE(5, 2)
+    EXL3_CASE(2, 2) EXL3_CASE(5, 2)
     EXL3_CASE(4, 0) EXL3_CASE(4, 1) EXL3_CASE(6, 0) EXL3_CASE(6, 1)
 #endif
 #undef EXL3_CASE
@@ -540,9 +543,9 @@ void exl3_reconstruct(at::Tensor trellis, at::Tensor w, int64_t n0, int64_t K, i
     bool ok = true;
     if (K == 4 && cb == 2) launch_reconstruct<4, 2>(trellis, w, n0, q);
     else if (K == 6 && cb == 2) launch_reconstruct<6, 2>(trellis, w, n0, q);
+    else if (K == 3 && cb == 2) launch_reconstruct<3, 2>(trellis, w, n0, q);   // Qwen3.8-Flash-Next routed experts
 #ifdef EXL3_ALL_CODEBOOKS
     else if (K == 2 && cb == 2) launch_reconstruct<2, 2>(trellis, w, n0, q);
-    else if (K == 3 && cb == 2) launch_reconstruct<3, 2>(trellis, w, n0, q);
     else if (K == 5 && cb == 2) launch_reconstruct<5, 2>(trellis, w, n0, q);
     else if (K == 4 && cb == 1) launch_reconstruct<4, 1>(trellis, w, n0, q);
     else if (K == 4 && cb == 0) launch_reconstruct<4, 0>(trellis, w, n0, q);
@@ -586,6 +589,8 @@ at::Tensor exl3_gemm_raw(at::Tensor xh_blocked, at::Tensor trellis, at::Tensor s
                                         : dispatch_dpas<4, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
     if (K == 6 && cb == 2) ok = use_vec ? dispatch_mr<6, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q)
                                         : dispatch_dpas<6, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
+    if (K == 3 && cb == 2) ok = use_vec ? dispatch_mr<3, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q)
+                                        : dispatch_dpas<3, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
     TORCH_CHECK(ok);
     (void)S;
     return part.sum(0);
@@ -758,9 +763,9 @@ at::Tensor exl3_linear_meta(at::Tensor x, at::Tensor trellis, at::Tensor suh, at
 }
 
 bool exl3_supported(int64_t K, int64_t cb) {
-    if (cb == 2 && (K == 4 || K == 6)) return true;
+    if (cb == 2 && (K == 3 || K == 4 || K == 6)) return true;
 #ifdef EXL3_ALL_CODEBOOKS
-    if (cb == 2 && (K == 2 || K == 3 || K == 5)) return true;
+    if (cb == 2 && (K == 2 || K == 5)) return true;
     if ((cb == 0 || cb == 1) && (K == 4 || K == 6)) return true;
 #endif
     return false;
