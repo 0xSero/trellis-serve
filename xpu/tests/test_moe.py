@@ -25,13 +25,22 @@ ap.add_argument("--bench-m", default="1,2,4,8,16")
 ap.add_argument("--iters", type=int, default=100)
 ap.add_argument("--dtype", default="bf16")
 ap.add_argument("--out", default="")
+ap.add_argument("--splits", default="", help="gu_p,dn_p")
+ap.add_argument("--mr", type=int, default=0)
+ap.add_argument("--placements", default="device,host,mixed50,mixed20")
 args = ap.parse_args()
 
-torch.ops.load_library(os.path.join(HERE, "..", "exl3xpu", "_moe.so"))
+torch.ops.load_library(os.environ.get("EXL3_MOE_LIB") or os.path.join(HERE, "..", "exl3xpu", "_moe.so"))
 X = torch.ops.exl3xpu_moe
 dev = torch.device("xpu:0")
 H, I, K, E, TOPK = 2560, 640, 3, 512, 10
 BLOB = X.blob_bytes(H, I, K)
+if args.splits:
+    X.moe_set_splits(*[int(v) for v in args.splits.split(",")])
+if args.mr:
+    X.moe_set_mr(args.mr)
+if os.environ.get("MOE_DEBUG_SKIP"):
+    X.moe_set_debug(int(os.environ["MOE_DEBUG_SKIP"]))
 dt = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 idx = json.load(open(f"{args.model}/model.safetensors.index.json"))["weight_map"]
 handles = {}
@@ -49,10 +58,18 @@ def expert_tensors(L, e):
     return {pr: {s: get(p + pr + "." + s) for s in ("trellis", "suh", "svh")} for pr in ("gate_proj", "up_proj", "down_proj")}
 
 
+def planar4(tr):
+    """int16 [rows, tiles, 16K] -> uint32 words, tiles grouped by 4, plane-major within the group (PLANAR4)."""
+    r, n, _ = tr.shape
+    D = K  # K=3: gcd(3,32)=1 -> D=3 words per period, 8 periods per tile
+    w = tr.contiguous().view(torch.int32).view(r, n // 4, 4, 8, D)       # [row, group, tile, period g, plane i]
+    return w.permute(0, 1, 4, 2, 3).contiguous()                         # [row, group, plane i, tile, g]
+
+
 def pack(t):
     b = lambda z: z.contiguous().view(torch.uint8).flatten()
     gu = torch.cat([t["gate_proj"]["trellis"], t["up_proj"]["trellis"]], dim=1)
-    blob = torch.cat([b(gu), b(t["down_proj"]["trellis"]), b(t["gate_proj"]["suh"]), b(t["up_proj"]["suh"]),
+    blob = torch.cat([b(planar4(gu)), b(planar4(t["down_proj"]["trellis"])), b(t["gate_proj"]["suh"]), b(t["up_proj"]["suh"]),
                       b(t["gate_proj"]["svh"]), b(t["up_proj"]["svh"]), b(t["down_proj"]["suh"]), b(t["down_proj"]["svh"])])
     assert blob.numel() == BLOB, (blob.numel(), BLOB)
     return blob
@@ -147,7 +164,8 @@ if args.bench_decode:
     for M in [int(v) for v in args.bench_m.split(",")]:
         x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
         routs = [routing(M, torch.Generator().manual_seed(1000 + i)) for i in range(64)]
-        for placement, frac in (("device", 0.0), ("host", 1.0), ("mixed50", 0.5), ("mixed20", 0.2)):
+        for placement, frac in [(p, {"device": 0.0, "host": 1.0, "mixed50": 0.5, "mixed20": 0.2}[p])
+                                for p in args.placements.split(",")]:
             mask = torch.rand(E, generator=torch.Generator().manual_seed(7)) < frac
             ptrs = ptr_table(host, devarena, mask)
             fns = [lambda ids=ids, w=w: X.moe_forward(x, ids, w, ptrs, I, K, E) for ids, w in routs]
