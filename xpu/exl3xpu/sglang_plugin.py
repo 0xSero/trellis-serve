@@ -114,6 +114,32 @@ def _unpack_signs(packed: torch.Tensor) -> torch.Tensor:
     return (1.0 - 2.0 * bits.flatten()).to(torch.float16)
 
 
+_MOE_STORE = None
+_MOE_HOT = None
+
+
+def _moe_store(H: int, I: int, K: int, n_experts: int):
+    """Process-wide ExpertStore (one slot arena shared by all MoE layers incl. the MTP layer)."""
+    global _MOE_STORE
+    if _MOE_STORE is None:
+        from .moe_offload import ExpertStore
+        _MOE_STORE = ExpertStore(H, I, K, n_experts, int(os.environ.get("EXL3_MOE_SLOTS", "0")), _dev())
+        logger.info("exl3xpu: expert store: %d device slots x %d B (%.2f GB)", _MOE_STORE.n_slots, _MOE_STORE.blob,
+                    _MOE_STORE.n_slots * _MOE_STORE.blob / 1e9)
+    s = _MOE_STORE
+    if (s.H, s.I, s.K, s.E) != (H, I, K, n_experts):
+        raise NotImplementedError(f"exl3xpu: MoE layers with different geometry {(H, I, K, n_experts)} vs {(s.H, s.I, s.K, s.E)}")
+    return s
+
+
+def _moe_hot() -> dict:
+    global _MOE_HOT
+    if _MOE_HOT is None:
+        p = os.environ.get("EXL3_MOE_HOT")
+        _MOE_HOT = json.load(open(p)) if p else {}
+    return _MOE_HOT
+
+
 def _build_classes():
     from sglang.srt.layers.quantization.base_config import LinearMethodBase, QuantizationConfig
     from sglang.srt.utils.common import set_weight_attrs
@@ -193,6 +219,14 @@ def _build_classes():
                     # k_scale/v_scale = 1.0 (no calibrated scales in EXL3 checkpoints): what fp8 KV needs on XPU
                     from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
                     return BaseKVCacheMethod(self)
+            except ImportError:  # pragma: no cover
+                pass
+            try:
+                from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+                if isinstance(layer, FusedMoE):
+                    base = norm_key(prefix) + "."
+                    experts = {k: v for k, v in self.modules.items() if k.startswith(base)}
+                    return Exl3XpuMoEMethod(prefix, experts) if experts else None
             except ImportError:  # pragma: no cover
                 pass
             parts = prefix.split(".")
@@ -331,6 +365,130 @@ def _build_classes():
 
         def forward(self, x):
             return self.method.apply(self, x)
+
+
+    from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+
+    class Exl3XpuMoEMethod(FusedMoEMethodBase):
+        """EXL3 routed experts on XPU through the two-tier ExpertStore (moe_offload.py): every expert in USM host
+        memory (zero-copy), EXL3_MOE_SLOTS device slots shared by all MoE layers (the expert cache), grouped
+        kernels addressing experts through a per-layer pointer table. TP = EP = 1, SiLU-gated, no fused shared
+        expert (--disable-shared-experts-fusion), routed_scaling_factor 1.
+        Env: EXL3_MOE_SLOTS (default 0: zero-copy only), EXL3_MOE_RESIDENT_PER_LAYER (fill slots with the first N
+        experts of each layer at load, default 0), EXL3_MOE_HOT (JSON {layer_key: [expert ids]} placed first)."""
+
+        _KEY_RE = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)$")
+        _ROLE = {"w1": "gate", "w3": "up", "w2": "down"}
+
+        def __init__(self, prefix: str, experts: dict):
+            self.prefix = prefix
+            self.key = norm_key(prefix)
+            self.runner = None
+            self.moe_runner_config = None
+            self.infos = {}
+            for k, info in experts.items():
+                m = self._KEY_RE.search(k)
+                if m is None:
+                    raise ValueError(f"exl3xpu: {prefix}: unexpected EXL3 matrix under the experts: {k}")
+                self.infos[(m.group(2)[:-5], int(m.group(1)))] = info
+
+        def create_weights(self, layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype,
+                           **extra_weight_attrs):
+            if getattr(layer, "moe_tp_size", 1) != 1 or getattr(layer, "moe_ep_size", 1) != 1:
+                raise NotImplementedError(f"exl3xpu: {self.prefix}: TP/EP EXL3 MoE is not implemented")
+            if getattr(layer, "num_fused_shared_experts", 0):
+                raise NotImplementedError(f"exl3xpu: {self.prefix}: run with --disable-shared-experts-fusion")
+            missing = [(r, e) for r in ("gate", "up", "down") for e in range(num_experts) if (r, e) not in self.infos]
+            if missing:
+                raise ValueError(f"exl3xpu: {self.prefix}: no EXL3 tensors for {len(missing)} expert matrices, e.g. {missing[0]}")
+            layer.exl3_store = {}
+            layer.exl3_num_experts, layer.exl3_hidden, layer.exl3_inter = num_experts, hidden_size, intermediate_size_per_partition
+            for w in ("w13", "w2"):
+                for suffix in _SUFFIXES:
+                    p = torch.nn.Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False)
+                    set_weight_attrs(p, {"weight_loader": self._loader(layer, suffix), "exl3_placeholder": True})
+                    layer.register_parameter(f"{w}_{suffix}", p)
+
+        def _loader(self, layer, suffix):
+            def load(param, loaded_weight, weight_name=None, shard_id=None, expert_id=None, *a, **k):
+                role = self._ROLE.get(shard_id)
+                if role is None or expert_id is None:
+                    raise ValueError(f"exl3xpu: {self.prefix}.{suffix}: unexpected shard {shard_id!r} / expert {expert_id!r}")
+                st = layer.exl3_store.setdefault(int(expert_id), {}).setdefault(role, {})
+                if suffix in st:
+                    raise ValueError(f"exl3xpu: {self.prefix}: {role} {suffix} of expert {expert_id} loaded twice")
+                st[suffix] = loaded_weight.detach().to("cpu", copy=True)
+                self._maybe_pack(layer, int(expert_id))
+            return load
+
+        def _maybe_pack(self, layer, e: int) -> None:
+            """Pack an expert into its host blob as soon as all its tensors arrived (bounded CPU staging)."""
+            st = layer.exl3_store.get(e)
+            if not st or any(r not in st or not {"trellis", "suh", "svh"} <= set(st[r]) for r in ("gate", "up", "down")):
+                return
+            for r in ("gate", "up", "down"):
+                t = st[r]["trellis"]
+                k_, n_, K_, cb_ = self.infos[(r, e)]
+                if (t.shape[0] * 16, t.shape[1] * 16, t.shape[2] // 16) != (k_, n_, K_) or cb_ != 2:
+                    raise ValueError(f"exl3xpu: {self.prefix}: {r}_proj expert {e}: {tuple(t.shape)} cb={cb_} "
+                                     f"(need mul1, header {(k_, n_, K_)})")
+            K = st["gate"]["trellis"].shape[2] // 16
+            if st["down"]["trellis"].shape[2] // 16 != K or st["up"]["trellis"].shape[2] // 16 != K:
+                raise NotImplementedError(f"exl3xpu: {self.prefix}: mixed K inside expert {e}")
+            store = _moe_store(layer.exl3_hidden, layer.exl3_inter, K, layer.exl3_num_experts)
+            if self.key not in store.host:
+                store.add_layer(self.key)
+            from .moe_offload import pack_expert
+            pack_expert(st["gate"], st["up"], st["down"], K, out=store.host_view(self.key)[e])
+            layer.exl3_K = K
+            layer.exl3_packed = getattr(layer, "exl3_packed", 0) + 1
+            del layer.exl3_store[e]
+
+        def create_moe_runner(self, layer, moe_runner_config):
+            self.moe_runner_config = cfg = moe_runner_config
+            if cfg.activation != "silu" or not getattr(cfg, "is_gated", True):
+                raise NotImplementedError(f"exl3xpu: {self.prefix}: only SiLU-gated experts (got {cfg.activation})")
+            if cfg.apply_router_weight_on_input:
+                raise NotImplementedError(f"exl3xpu: {self.prefix}: apply_router_weight_on_input unsupported")
+            if cfg.routed_scaling_factor not in (None, 1.0):
+                raise NotImplementedError(f"exl3xpu: {self.prefix}: routed_scaling_factor {cfg.routed_scaling_factor}")
+
+        def process_weights_after_loading(self, layer) -> None:
+            if not hasattr(layer, "exl3_store"):
+                return
+            n = layer.exl3_num_experts
+            if layer.exl3_store or getattr(layer, "exl3_packed", 0) != n:
+                raise ValueError(f"exl3xpu: {self.prefix}: {getattr(layer, 'exl3_packed', 0)} of {n} experts complete "
+                                 f"({len(layer.exl3_store)} partial)")
+            del layer.exl3_store
+            for w in ("w13", "w2"):
+                for suffix in _SUFFIXES:
+                    delattr(layer, f"{w}_{suffix}")
+            store = _moe_store(layer.exl3_hidden, layer.exl3_inter, layer.exl3_K, n)
+            hot = _moe_hot().get(self.key, [])
+            per = int(os.environ.get("EXL3_MOE_RESIDENT_PER_LAYER", "0"))
+            want = list(dict.fromkeys(list(hot) + list(range(n))))[:max(per, len(hot))] if (per or hot) else []
+            want = want[:len(store.free_slots)]
+            if want:
+                store.make_resident(self.key, want)
+            layer.exl3_moe_store = store
+            logger.info("exl3xpu: %s: %d experts K=%d packed to host USM (%.3f GB), %d resident in device slots "
+                        "(%d slots free)", self.prefix, n, layer.exl3_K, n * store.blob / 1e9,
+                        store.resident_count(self.key), len(store.free_slots))
+
+        def apply(self, layer, dispatch_output):
+            from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+            x = dispatch_output.hidden_states
+            tk = dispatch_output.topk_output
+            flat = x.reshape(-1, x.shape[-1])
+            y = layer.exl3_moe_store.forward(self.key, flat, tk.topk_ids.reshape(flat.shape[0], -1),
+                                             tk.topk_weights.reshape(flat.shape[0], -1))
+            return StandardCombineInput(hidden_states=y.view_as(x))
+
+        def get_triton_quant_info(self, layer):
+            raise NotImplementedError("EXL3 experts do not run on the Triton MoE runner")
+
+    globals()["Exl3XpuMoEMethod"] = Exl3XpuMoEMethod
 
     return Exl3XpuConfig, Exl3XpuLinearMethod, Exl3Dense
 
