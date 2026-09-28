@@ -806,12 +806,18 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
                           int* slot_of, int* slot_key, int* slot_last, int* tick, const int64_t* host_base,
                           int64_t slot_base, int64_t blob, int64_t* fill_all, int* fill_list, int max_fill) {
     constexpr int WG = 1024;
+    // Victim selection = exact LRU by radix select over u = slot_last + 1 (empty slots u = 0, slots touched this tick
+    // excluded): four 8-bit histogram passes find the nm-th smallest u (tau, ties needed), one compaction pass takes
+    // every slot with u < tau and `need` slots with u == tau. v1 did one argmin pass per miss (~100 us per miss at S=12k).
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<int, 1> need(sycl::range<1>(E), h), miss(sycl::range<1>(E), h), sc(sycl::range<1>(2), h);
+        sycl::local_accessor<int, 1> need(sycl::range<1>(E), h), miss(sycl::range<1>(E), h), vict(sycl::range<1>(E), h);
+        sycl::local_accessor<int, 1> hist(sycl::range<1>(256), h), sc(sycl::range<1>(8), h);
         h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
             int l = it.get_local_id(0);
             auto g = it.get_group();
-            if (l == 0) { sc[0] = ++tick[0]; sc[1] = 0; }
+            using lref = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                          sycl::access::address_space::local_space>;
+            if (l == 0) { sc[0] = ++tick[0]; sc[1] = 0; sc[2] = 0; sc[3] = 0; }
             for (int e = l; e < E; e += WG) need[e] = 0;
             sycl::group_barrier(g);
             for (int i = l; i < npairs; i += WG) need[ids[i]] = 1;
@@ -821,40 +827,100 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
                 if (!need[e]) continue;
                 int s = slot_of[layer * E + e];
                 if (s >= 0) slot_last[s] = T;
-                else {
-                    int k = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
-                                             sycl::access::address_space::local_space>(sc[1]).fetch_add(1);
-                    miss[k] = e;
-                }
+                else miss[lref(sc[1]).fetch_add(1)] = e;
             }
             sycl::group_barrier(g);
             int nm = S > 0 ? sycl::min(sc[1], max_fill) : 0;
-            int done = 0;
-            for (int mi = 0; mi < nm; ++mi) {
-                int64_t best = INT64_MAX;
-                for (int s = l; s < S; s += WG) {
-                    int64_t key = ((int64_t)slot_last[s] << 32) | (int64_t)(uint32_t)s;
-                    best = key < best ? key : best;
-                }
-                best = sycl::reduce_over_group(g, best, sycl::minimum<int64_t>());
-                if ((int)(best >> 32) == T) break;          // every slot is in use this step: stop filling
-                int s = (int)(best & 0xffffffff);
-                if (l == 0) {
-                    int e = miss[mi];
-                    int old = slot_key[s];
-                    if (old >= 0) {
-                        slot_of[old] = -1;
-                        ptrs_all[old] = host_base[old / E] + (int64_t)(old % E) * blob;
+            if (nm == 0) { if (l == 0) fill_list[0] = 0; return; }
+            // eligible = not touched this tick. Each work-item owns a contiguous chunk of slots (slots filled together
+            // share ticks), and aggregates runs of equal bins locally: one SLM atomic per run, not per slot.
+            const int C = (S + WG - 1) / WG, s0 = l * C, s1 = sycl::min(S, s0 + C);
+            int elig = 0, empty = 0;
+            uint32_t umin = 0xFFFFFFFFu, umax = 0;
+            for (int s = s0; s < s1; ++s) {
+                int la = slot_last[s];
+                if (la == T) continue;
+                uint32_t u = (uint32_t)(la + 1);
+                ++elig; empty += la == -1;
+                umin = sycl::min(umin, u); umax = sycl::max(umax, u);
+            }
+            elig = sycl::reduce_over_group(g, elig, sycl::plus<int>());
+            empty = sycl::reduce_over_group(g, empty, sycl::plus<int>());
+            umin = sycl::reduce_over_group(g, umin, sycl::minimum<uint32_t>());
+            umax = sycl::reduce_over_group(g, umax, sycl::maximum<uint32_t>());
+            nm = sycl::min(nm, elig);
+            if (nm == 0) { if (l == 0) fill_list[0] = 0; return; }
+            // start at the highest byte where the eligible keys differ; the bytes above are the common prefix
+            int top = 24;
+            while (top > 0 && ((umin ^ umax) >> top) == 0) top -= 8;
+            uint32_t prefix = top == 24 ? 0u : (umin & (0xFFFFFFFFu << (top + 8)));
+            int want = nm;
+            // warm-up fast path: enough empty slots (u = 0) -> tau = 0, no radix passes
+            if (empty >= nm) { prefix = 0; top = -8; }
+            for (int shift = top; shift >= 0; shift -= 8) {
+                if (l < 256) hist[l] = 0;
+                sycl::group_barrier(g);
+                uint32_t hmask = shift == 24 ? 0u : (0xFFFFFFFFu << (shift + 8));
+                int run_bin = -1, run_n = 0;
+                for (int s = s0; s < s1; ++s) {
+                    int la = slot_last[s];
+                    if (la == T) continue;
+                    uint32_t u = (uint32_t)(la + 1);
+                    if ((u & hmask) != (prefix & hmask)) continue;
+                    int b = (u >> shift) & 255;
+                    if (b != run_bin) {
+                        if (run_n) lref(hist[run_bin]).fetch_add(run_n);
+                        run_bin = b; run_n = 0;
                     }
-                    int key = layer * E + e;
-                    slot_key[s] = key; slot_last[s] = T; slot_of[key] = s;
-                    fill_all[key] = slot_base + (int64_t)s * blob;
-                    fill_list[1 + mi] = e;
+                    ++run_n;
                 }
-                done = mi + 1;
+                if (run_n) lref(hist[run_bin]).fetch_add(run_n);
+                sycl::group_barrier(g);
+                int c = l < 256 ? hist[l] : 0;
+                int cum = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());
+                if (l < 256 && cum < want && want <= cum + c) { sc[4] = l; sc[5] = want - cum; }
+                sycl::group_barrier(g);
+                prefix |= (uint32_t)sc[4] << shift;
+                want = sc[5];
                 sycl::group_barrier(g);
             }
-            if (l == 0) fill_list[0] = done;
+            // compaction: all u < tau, then `want` slots with u == tau (ranges reserved with one atomic per item)
+            int n_lt = 0, n_eq = 0;
+            for (int s = s0; s < s1; ++s) {
+                int la = slot_last[s];
+                if (la == T) continue;
+                uint32_t u = (uint32_t)(la + 1);
+                n_lt += u < prefix;
+                n_eq += u == prefix;
+            }
+            int base_lt = n_lt ? lref(sc[2]).fetch_add(n_lt) : 0;
+            int base_eq = n_eq ? lref(sc[3]).fetch_add(n_eq) : 0;
+            int take_eq = sycl::max(0, sycl::min(n_eq, want - base_eq));
+            sycl::group_barrier(g);
+            const int total_lt = sc[2];                 // == nm - want
+            int ilt = base_lt, ieq = 0;
+            for (int s = s0; s < s1; ++s) {
+                int la = slot_last[s];
+                if (la == T) continue;
+                uint32_t u = (uint32_t)(la + 1);
+                if (u < prefix) vict[ilt++] = s;
+                else if (u == prefix && ieq < take_eq) vict[total_lt + base_eq + ieq++] = s;
+            }
+            sycl::group_barrier(g);
+            // assign (distinct slots, distinct experts: no conflicts)
+            for (int mi = l; mi < nm; mi += WG) {
+                int s = vict[mi], e = miss[mi];
+                int old = slot_key[s];
+                if (old >= 0) {
+                    slot_of[old] = -1;
+                    ptrs_all[old] = host_base[old / E] + (int64_t)(old % E) * blob;
+                }
+                int key = layer * E + e;
+                slot_key[s] = key; slot_last[s] = T; slot_of[key] = s;
+                fill_all[key] = slot_base + (int64_t)s * blob;
+                fill_list[1 + mi] = e;
+            }
+            if (l == 0) fill_list[0] = nm;
         });
     });
 }
