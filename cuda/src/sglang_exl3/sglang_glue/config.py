@@ -128,9 +128,15 @@ class Exl3Config(QuantizationConfig):
         except Exception:  # pragma: no cover
             FusedMoE = ()
         if FusedMoE and isinstance(layer, FusedMoE):
-            from .moe import Exl3MoEMethod
             experts = {k: v for k, v in self.modules.items() if _expert_of(k, prefix)}
-            return Exl3MoEMethod(self, prefix, experts) if experts else None
+            if not experts:
+                return None
+            if os.environ.get("SGLANG_EXL3_MOE_OFFLOAD", "") == "cpu":
+                # routed experts on exllamav3's CPU worker (host RAM tier), graph-safe decode handoff
+                from ..offload.cpu_moe import Exl3CpuMoEMethod
+                return Exl3CpuMoEMethod(self, prefix, experts)
+            from .moe import Exl3MoEMethod
+            return Exl3MoEMethod(self, prefix, experts)
         if isinstance(layer, ParallelLMHead):
             info = self.lookup(prefix)
             return Exl3LinearMethod(prefix, [info]) if info else None

@@ -27,6 +27,14 @@ def activate() -> None:
     _patch_dflash_exl3_draft()
     if os.environ.get("SGLANG_EXL3_EMBED_HOST", "0") == "1":
         _patch_host_embedding()
+    if os.environ.get("SGLANG_EXL3_NGRAM_HOST", "1") == "1":
+        # Qwen3.8-Flash-Next EXL3 n-gram table: pinned host memory + zero-copy gather/decode (offload/ngram_host.py);
+        # a no-op for checkpoints without ngram_embedding.safetensors
+        try:
+            from .offload import ngram_host
+            ngram_host.install()
+        except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp
+            logger.info("sglang-exl3: n-gram host table shim not installed (%s)", e)
     if os.environ.get("SGLANG_EXL3_VIT_SDPA", "0") == "1":
         from .sglang_glue import vit_attn
         vit_attn.install()
