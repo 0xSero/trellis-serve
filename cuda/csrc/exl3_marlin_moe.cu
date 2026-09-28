@@ -498,14 +498,6 @@ void moe_combine(const at::Tensor& yd, const at::Tensor& w, const at::Tensor& id
   // clang-format on
 }
 
-// exl3_moe_orig_builder.cu: original-basis expert weights straight into vLLM's [E, out, in] layout
-void moe_build_orig_vllm(at::Tensor& out, const at::Tensor& trellis_ptrs, const at::Tensor& suh_ptrs,
-                         const at::Tensor& svh_ptrs, int64_t n, int64_t row_offset, int64_t cb, int64_t bits);
-
-void moe_build_orig_vllm_stacked(at::Tensor& out, const at::Tensor& pack, const at::Tensor& suh, const at::Tensor& svh,
-                                 int64_t n, int64_t col_offset, int64_t suh_off, int64_t svh_off, int64_t row_offset, int64_t cb,
-                                 const std::optional<at::Tensor>& out_ids);
-
 void moe_init_device(int64_t device) { trellis_exl3_marlin_moe::dev_state((int)device); }
 
 void moe_set_gridstride_blocks(int64_t n) {
@@ -627,15 +619,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_had_in", &moe_had_in, "per-slot input transform with per-expert suh (gather + scale + Had128)");
   m.def("moe_glu_had_in", &moe_glu_had_in, "silu(gate) * up -> fp16 -> per-expert suh -> Had128 (down input)");
   m.def("moe_combine", &moe_combine, "router-weighted fp32 sum over a token's top-k slots");
-  m.def("moe_build_orig_vllm", &moe_build_orig_vllm,
-        "W = diag(suh) H W_hat H diag(svh) of every expert (ExLlamaV3's reconstruct_had arithmetic) written transposed into out[E, rows, k]",
-        py::arg("out"), py::arg("trellis_ptrs"), py::arg("suh_ptrs"), py::arg("svh_ptrs"), py::arg("n"), py::arg("row_offset"), py::arg("cb"),
-        py::arg("bits") = 4);
-  m.def("moe_build_orig_vllm_stacked", &moe_build_orig_vllm_stacked,
-        "the same W, read from the grouped kernel's resident pack ([E, k/16, n/64, 32, 4] K = 4 or [E, k/16, n/64, 4, 24] K = 3) and stacked "
-        "suh / svh (no pointer tables); out_ids (int32 [E_pack], optional) = output expert per pack expert (mixed-K arenas)",
-        py::arg("out"), py::arg("pack"), py::arg("suh"), py::arg("svh"), py::arg("n"), py::arg("col_offset"), py::arg("suh_off"), py::arg("svh_off"),
-        py::arg("row_offset"), py::arg("cb"), py::arg("out_ids") = py::none());
   m.def("moe_init_device", &moe_init_device, "allocate per-device state (locks, fp32 reduce scratch)");
   m.def("moe_set_gridstride_blocks", &moe_set_gridstride_blocks,
         "knob: -1 = automatic (default), 0 = one 32-thread block per (row, 128-block) item in the per-slot transforms, n > 0 = n grid-strided 256-thread blocks");
