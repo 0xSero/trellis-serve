@@ -864,7 +864,16 @@ void moe_align_decode(const at::Tensor& topk_ids, const std::vector<at::Tensor>&
       P(eids, 0), P(eids, 1), (int)eids[0].numel(), nc > 1 ? (int)eids[1].numel() : 0, P(post, 0), P(post, 1));
 }
 
+// exl3_offload_cache.cu: device-side expert cache manager
+void moe_cache_step(const at::Tensor& ids, int64_t layer, at::Tensor& slot_of, at::Tensor& owner, at::Tensor& stamp,
+                    at::Tensor& ref, at::Tensor& hand, at::Tensor& clock, at::Tensor& tables, at::Tensor& admit,
+                    const at::Tensor& host_bases, int64_t arena_base, int64_t rec, const at::Tensor& offs,
+                    at::Tensor& stats, bool do_admit);
+void moe_cache_commit(const at::Tensor& ids, int64_t layer, at::Tensor& tables, at::Tensor& admit);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("moe_cache_step", &moe_cache_step, "expert cache: hits/misses, CLOCK victims, evictions, admission rows (before the MoE)");
+  m.def("moe_cache_commit", &moe_cache_commit, "expert cache: consumed admission rows -> table (after the MoE)");
   m.def("moe_align_decode", &moe_align_decode, "decode-sized routing for mixed-K layers: vLLM moe_align_block_size outputs for every K class in ONE launch",
         py::arg("topk_ids"), py::arg("maps"), py::arg("blocks"), py::arg("num_experts"), py::arg("sorted"), py::arg("expert_ids"), py::arg("num_post"));
   m.def("moe_gemm", &moe_gemm, "grouped rotated-basis EXL3 GEMM over moe blocks (+ in-launch output transform)",

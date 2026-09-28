@@ -182,3 +182,59 @@ def align_decode(topk_ids: torch.Tensor, block: int, num_experts: int):
     post = torch.empty((1,), dtype=torch.int32, device=ids.device)
     _mod().moe_align_decode(ids.contiguous(), [m], [int(block)], num_experts, [sorted_ids], [eids], [post])
     return sorted_ids, eids, post
+
+
+class ExpertCache:
+    """GPU expert cache shared by all MoE layers, managed on the device (csrc/exl3_offload_cache.cu).
+
+    Owns: the slot arena (uint8 [slots, record_bytes]), per-layer pointer tables [L, E, 6] (initially every expert on
+    its layer's host bank), admission tables, CLOCK state and per-layer hit/miss counters. Per layer and step:
+
+        cache.step(layer, topk_ids)                 # before the MoE: hits pinned, misses get victim slots
+        y = cache.run(layer, x, w, topk_ids, sorted_ids, expert_ids, npost, block)   # zero-copy misses + admission
+        # (run = step + om.run(..., table=cache.tables[layer], admit=cache.admit[layer]) + commit)
+
+    Everything is device-side with static shapes (CUDA-graph capturable). topk_ids must be int32 (layer-local ids,
+    sentinel E = dropped slot). host_bases[l] = kernel-visible base address of layer l's host bank (record layout).
+    Misses are served zero-copy from the host this step and written into their slot by the GEMM (fused admission);
+    from the next step on they are hits. admit=False: misses are served zero-copy without admission (bypass)."""
+
+    def __init__(self, num_layers: int, num_experts: int, lay: RecordLayout, host_bases, slots: int, device=None):
+        dev = torch.device(device or "cuda")
+        self.L, self.E, self.S, self.lay = num_layers, num_experts, slots, lay
+        self.arena = torch.empty((max(slots, 1), lay.record_bytes), dtype=torch.uint8, device=dev)
+        self.offs = lay.offsets_tensor(dev)
+        self.host_bases = torch.tensor(list(host_bases), dtype=torch.int64, device=dev)
+        e = torch.arange(num_experts, dtype=torch.int64, device=dev)
+        rows = self.host_bases.view(-1, 1, 1) + (e * lay.record_bytes).view(1, -1, 1) + self.offs.view(1, 1, -1)
+        self.tables = rows.contiguous()                                            # int64 [L, E, 6]
+        self.admit = torch.zeros_like(self.tables)
+        i32 = dict(dtype=torch.int32, device=dev)
+        self.slot_of = torch.full((num_layers * num_experts,), -1, **i32)
+        self.owner = torch.full((max(slots, 1),), -1, **i32)
+        self.stamp = torch.zeros((max(slots, 1),), dtype=torch.int64, device=dev)
+        self.ref = torch.zeros((max(slots, 1),), **i32)
+        self.hand = torch.zeros((1,), **i32)
+        self.clock = torch.zeros((1,), dtype=torch.int64, device=dev)
+        self.stats = torch.zeros((num_layers, 2), dtype=torch.int64, device=dev)
+
+    def step(self, layer: int, topk_ids: torch.Tensor, admit: bool = True) -> None:
+        _mod().moe_cache_step(topk_ids.reshape(-1), layer, self.slot_of, self.owner, self.stamp, self.ref, self.hand,
+                              self.clock, self.tables, self.admit, self.host_bases, self.arena.data_ptr(),
+                              self.lay.record_bytes, self.offs, self.stats, admit and self.S > 0)
+
+    def commit(self, layer: int, topk_ids: torch.Tensor) -> None:
+        _mod().moe_cache_commit(topk_ids.reshape(-1), layer, self.tables, self.admit)
+
+    def run(self, layer: int, x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, block: int,
+            codebook: int = 2, admit: bool = True, out=None) -> torch.Tensor:
+        self.step(layer, topk_ids, admit)
+        y = run(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, block, self.tables[layer], self.lay,
+                codebook, out=out, admit=self.admit[layer] if admit else None)
+        if admit:
+            self.commit(layer, topk_ids)
+        return y
+
+    def hit_rate(self) -> torch.Tensor:
+        s = self.stats.double()
+        return s[:, 0] / (s[:, 0] + s[:, 1]).clamp(min=1)
