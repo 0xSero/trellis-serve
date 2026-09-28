@@ -676,7 +676,9 @@ static void launch_align(sycl::queue& q, const int* ids, const float* w, int npa
     });
 }
 
-static int g_gu_p = 10, g_dn_p = 5;
+// B70 (planar4 + pair mode), us/layer device M=1 / M=4: gu,dn 10,5 66.0/205.5; 5,5 63.0/196.6; 5,10 60.6/200.3;
+// 10,10 66.1/209.1; 10,20 72.5/241.5 -> gu 5, dn 10 for M = 1 else 5 (g_dn_p = 0: auto)
+static int g_gu_p = 5, g_dn_p = 0;
 void moe_set_splits(int64_t gu_p, int64_t dn_p) { g_gu_p = (int)gu_p; g_dn_p = (int)dn_p; }
 
 template <int K, int MR, int P, typename TIn>
@@ -928,7 +930,10 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
     else if (x.scalar_type() == at::kBFloat16)
         gateup_dispatch<3, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
     else TORCH_CHECK(false, "x dtype");
+    int dn_p_save = g_dn_p;
+    if (g_dn_p == 0) g_dn_p = M <= 1 ? 10 : 5;   // M=2: P=10 120.9 us vs P=5 112.8
     if (!(g_debug_skip & 2)) down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
+    g_dn_p = dn_p_save;
     int n = M * (H / 128), local = 8;
     auto run_c = [&](auto tag) {
         using TO = decltype(tag);
