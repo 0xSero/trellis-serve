@@ -115,6 +115,7 @@ class ExpertStore:
         self.fill_all = torch.zeros(LE, dtype=torch.int64, device=self.dev)
         self.fill_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
         self.slot_base = s64(self.slots.data_ptr()) if n_slots else 0
+        self._cache_used = False            # set by forward_cached: static ops must resync from the device first
 
     # ---- layers
     def add_layer(self, key, blobs: torch.Tensor | None = None) -> torch.Tensor:
@@ -148,6 +149,7 @@ class ExpertStore:
         """Copy experts into free device slots, then repoint the table (and the device slot map). Copies and the
         table update are ordered on `stream` (default: current stream). Returns #copied."""
         s_ = stream or torch.xpu.current_stream()
+        self._resync()
         so = self.slot_of[key]
         li = self.layer_index[key]
         todo = [int(e) for e in experts if so[int(e)] < 0]
@@ -178,6 +180,7 @@ class ExpertStore:
 
     def evict(self, key, experts) -> None:
         """Repoint to the host copy; the slot becomes reusable after the current stream's already-queued work."""
+        self._resync()
         so = self.slot_of[key]
         li = self.layer_index[key]
         es, sls = [], []
@@ -233,6 +236,7 @@ class ExpertStore:
         and are written through into the LRU slot (committed at the end of the call). No host sync, graph-safe.
         Do not mix with make_resident/evict on the same slots while cached calls are queued."""
         ids, w = self._rt(topk_ids, topk_w)
+        self._cache_used = True
         return self.X.moe_forward_cached(x, ids, w, self.ptrs_all, self.layer_index[key], self.slot_of_dev,
                                          self.slot_key, self.slot_last, self.tick, self.host_base, self.slot_base,
                                          self.fill_all, self.fill_list, self.E if max_fill is None else max_fill,
@@ -246,6 +250,7 @@ class ExpertStore:
         if self._stage[buf] is None:
             self._stage[buf] = torch.empty((self.E, self.blob), dtype=torch.uint8, device=self.dev)
         st = self._stage[buf]
+        self._resync()
         so = self.slot_of[key]
         miss = (so < 0).nonzero().flatten().tolist()
         with torch.xpu.stream(stream):
@@ -264,7 +269,24 @@ class ExpertStore:
         return sp.to(self.dev, non_blocking=True)      # CPU mirror only: no device->host read
 
     def sync_mirror(self) -> None:
-        """Refresh the CPU slot mirror from the device cache state (device->host read; not for the decode loop)."""
+        """Rebuild the CPU mirror (slot_of, slot_owner, free list) from the device cache state. Device->host read of
+        the slot map (synchronises the current stream): for static placement ops, never in the decode loop."""
+        sk = self.slot_key.cpu()
         sod = self.slot_of_dev.cpu()
+        keys = {li: key for key, li in self.layer_index.items()}
         for key, li in self.layer_index.items():
             self.slot_of[key] = sod[li * self.E:(li + 1) * self.E].clone()
+        self.slot_owner = [None] * self.n_slots
+        free = []
+        for sl in range(self.n_slots):
+            k = int(sk[sl])
+            if k < 0:
+                free.append(sl)
+            else:
+                self.slot_owner[sl] = (keys[k // self.E], k % self.E)
+        self.free_slots = free[::-1]
+
+    def _resync(self) -> None:
+        if self._cache_used:
+            self.sync_mirror()
+            self._cache_used = False

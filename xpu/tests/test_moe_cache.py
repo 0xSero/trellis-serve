@@ -84,6 +84,20 @@ for step in range(args.steps):
         if step % 50 == 0:
             print({"step": step, "layer": L, "M": M, "fills": nfill, "equal": torch.equal(yc, yh)}, flush=True)
 torch.xpu.synchronize()
+# static ops after device-cache activity must not clobber device-owned slots
+k0 = f"layers.{layers[0]}.mlp.experts"
+store.sync_mirror()
+owned = (store.slot_of[k0] >= 0).nonzero().flatten().tolist()
+store.evict(k0, owned[:32])
+store.make_resident(k0, [e for e in range(E) if store.slot_of[k0][e] < 0][:32])
+for step in range(args.steps, args.steps + 20):
+    for L in layers:
+        key = f"layers.{L}.mlp.experts"
+        x = (torch.randn((1, H), device=dev) * 0.5).to(torch.bfloat16)
+        ids, w = route(L, 1, step)
+        if not torch.equal(store.forward_cached(key, x, ids, w), store.forward(key, x, ids, w, ptrs=host_tab[key])):
+            bad += 1
+torch.xpu.synchronize()
 # consistency
 sk, sod, pa = store.slot_key.cpu(), store.slot_of_dev.cpu(), store.ptrs_all.cpu()
 incons = 0

@@ -114,11 +114,13 @@ for phase in ("as_loaded", "after_evict_128_make_resident_64"):
         wts = (wts / wts.sum(-1, keepdim=True)).float()
         do = types.SimpleNamespace(hidden_states=x, topk_output=types.SimpleNamespace(topk_ids=ids.to(dev), topk_weights=wts.to(dev)))
         y = meth.apply(layer, do).hidden_states
+        if sp._MOE_CACHE:
+            y = meth.apply(layer, do).hidden_states          # second call: the first one's fills are now hits
         torch.xpu.synchronize()
         r = ref_moe(x, ids, wts)
         rms = ((y.float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
         floor = ((r.bfloat16().float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
-        rec = {"phase": phase, "M": M, "resident": store.resident_count(meth.key), "rms_rel": round(rms, 5),
+        rec = {"phase": phase, "M": M, "resident": store.device_resident_count(meth.key), "rms_rel": round(rms, 5),
                "floor_bf16": round(floor, 5), "ok": rms < 2 * floor + 1e-3}
         res.append(rec)
         print(rec, flush=True)

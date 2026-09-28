@@ -116,6 +116,7 @@ def _unpack_signs(packed: torch.Tensor) -> torch.Tensor:
 
 _MOE_STORE = None
 _MOE_HOT = None
+_MOE_CACHE = os.environ.get("EXL3_MOE_CACHE", "0") == "1"
 
 
 def _moe_store(H: int, I: int, K: int, n_experts: int):
@@ -375,7 +376,8 @@ def _build_classes():
         kernels addressing experts through a per-layer pointer table. TP = EP = 1, SiLU-gated, no fused shared
         expert (--disable-shared-experts-fusion), routed_scaling_factor 1.
         Env: EXL3_MOE_SLOTS (default 0: zero-copy only), EXL3_MOE_RESIDENT_PER_LAYER (fill slots with the first N
-        experts of each layer at load, default 0), EXL3_MOE_HOT (JSON {layer_key: [expert ids]} placed first)."""
+        experts of each layer at load, default 0), EXL3_MOE_HOT (JSON {layer_key: [expert ids]} placed first),
+        EXL3_MOE_CACHE=1 (decode through the device-managed LRU cache: misses written through into slots)."""
 
         _KEY_RE = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)$")
         _ROLE = {"w1": "gate", "w3": "up", "w2": "down"}
@@ -481,8 +483,8 @@ def _build_classes():
             x = dispatch_output.hidden_states
             tk = dispatch_output.topk_output
             flat = x.reshape(-1, x.shape[-1])
-            y = layer.exl3_moe_store.forward(self.key, flat, tk.topk_ids.reshape(flat.shape[0], -1),
-                                             tk.topk_weights.reshape(flat.shape[0], -1))
+            fwd = layer.exl3_moe_store.forward_cached if _MOE_CACHE else layer.exl3_moe_store.forward
+            y = fwd(self.key, flat, tk.topk_ids.reshape(flat.shape[0], -1), tk.topk_weights.reshape(flat.shape[0], -1))
             return StandardCombineInput(hidden_states=y.view_as(x))
 
         def get_triton_quant_info(self, layer):
