@@ -33,7 +33,7 @@ _PROJ = ("gate_proj", "up_proj", "down_proj")
 
 def align(ids, block, e):
     from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import moe_align_block_size
-    return moe_align_block_size(ids, block, e)
+    return moe_align_block_size(ids, block, e, ignore_invalid_expert=True)   # drop sentinel = e
 
 
 def uniform_routing(tokens, top_k, e, gen, device="cuda"):
@@ -292,6 +292,129 @@ def bench_zero_copy_read(L: Layer, reps: int) -> dict:
     return out
 
 
+def check_synthetic_k4(gen, experts=16, hidden=2560, inter=640) -> dict:
+    """K=4 must keep working: random K=4 MUL1 trellises (valid bit streams), pointer path == stacked path and the
+    decoded W_hat == exllamav3 reconstruct, from host and device records."""
+    mk = lambda k, n: torch.randint(-32768, 32767, (k // 16, n // 16, 64), generator=gen, dtype=torch.int16)
+    sv = lambda n: ((torch.randint(0, 2, (n,), generator=gen) * 2 - 1).half())
+    t = {"gate_proj": ([mk(hidden, inter) for _ in range(experts)], [sv(hidden) for _ in range(experts)], [sv(inter) for _ in range(experts)]),
+         "up_proj": ([mk(hidden, inter) for _ in range(experts)], [sv(hidden) for _ in range(experts)], [sv(inter) for _ in range(experts)]),
+         "down_proj": ([mk(inter, hidden) for _ in range(experts)], [sv(inter) for _ in range(experts)], [sv(hidden) for _ in range(experts)])}
+    cb = 2
+    lay = offload_moe.layout(hidden, inter, 4)
+    host = offload_moe.build_bank(t["gate_proj"], t["up_proj"], t["down_proj"], lay, "host")
+    dev = host.cuda()
+    pack = marlin_moe.prepare(t["gate_proj"], t["up_proj"], t["down_proj"], cb)
+    offs = lay.offsets_tensor("cuda")
+    table = offload_moe.new_table(experts)
+    ar = torch.arange(experts, dtype=torch.int64, device="cuda")
+    res = {}
+    for tokens in (1, 8, 256, 256, 256, 1024):
+        ids, w = uniform_routing(tokens, 4, experts, gen)
+        x = (torch.randn((tokens, hidden), generator=gen) * 0.01).to(torch.float16).cuda()   # random trellis: keep fp16 finite
+        block = marlin_moe.moe_block_size(tokens, 4, experts)
+        al = align(ids, block, experts)
+        ys = marlin_moe.run(x, w, ids, *al, block, pack)
+        for where, base in (("device", dev.data_ptr()), ("host", offload_moe.base_address(host))):
+            offload_moe.fill_table_(table, base + ar * lay.record_bytes, offs)
+            yp = offload_moe.run(x, w, ids, *al, block, table, lay, cb)
+            res[f"{tokens}:{where}_eq_stacked"] = eq16(yp, ys)
+            if not eq16(yp, ys):
+                d = (yp.view(torch.int16) != ys.view(torch.int16))
+                print("K4 mismatch", tokens, where, "block", block, "n_diff", int(d.sum()), "rows", d.any(1).nonzero().flatten()[:20].tolist(),
+                      "finite ys/yp", bool(torch.isfinite(ys).all()), bool(torch.isfinite(yp).all()),
+                      "max abs diff", float((yp.float() - ys.float()).abs().max()), flush=True)
+                for blk in (8, 16, 32, 64):
+                    al2 = align(ids, blk, experts)
+                    a1 = marlin_moe.run(x, w, ids, *al2, blk, pack); a2 = offload_moe.run(x, w, ids, *al2, blk, table, lay, cb)
+                    a3 = marlin_moe.run(x, w, ids, *al2, blk, pack)
+                    print("  block", blk, "ptr==stack", eq16(a1, a2), "stack deterministic", eq16(a1, a3), flush=True)
+        res[f"{tokens}:finite"] = bool(torch.isfinite(ys).all())
+    mod = offload_moe._mod()
+    for where, base in (("device", dev.data_ptr()), ("host", offload_moe.base_address(host))):
+        offload_moe.fill_table_(table, base + ar * lay.record_bytes, offs)
+        for e in (0, experts - 1):
+            eye = torch.eye(inter, dtype=torch.float16, device="cuda")
+            c2 = torch.empty((inter, hidden), dtype=torch.float16, device="cuda")
+            s2, ei2, p2 = align(torch.full((inter, 1), e, dtype=torch.int32, device="cuda"), 64, experts)
+            mod.moe_gemm_ptr(eye, c2, table, offload_moe.F_W2, -1, 4, s2, ei2, p2, 64, 0, cb)
+            res[f"decode:{where}:e{e}:down_eq_exllamav3"] = eq16(c2, reference.reconstruct(t["down_proj"][0][e].cuda(), cb))
+    res["pass"] = all(res.values())
+    print("K4", res, flush=True)
+    return res
+
+
+def check_masked(L: Layer, gen) -> dict:
+    """Hybrid split contract: slots whose id is E (num_experts) are dropped (not read, not summed), so a CPU / other path can serve
+    them. y(ids with -1) vs float64 of the kept slots only (masked slots given weight 0)."""
+    t_gpu = {p: tuple([x.cuda() for x in g] for g in L.t_cpu[p]) for p in _PROJ}
+    ref13 = torch.stack([torch.cat([reference.reconstruct(g, L.cb), reference.reconstruct(u, L.cb)], dim=1)
+                         for g, u in zip(t_gpu["gate_proj"][0], t_gpu["up_proj"][0])])
+    ref2 = torch.stack([reference.reconstruct(d, L.cb) for d in t_gpu["down_proj"][0]])
+    out = {}
+    for tokens in (1, 16, 512):
+        ids, w = uniform_routing(tokens, 10, L.e, gen)
+        x = (torch.randn((tokens, L.hidden), generator=gen) * 0.5).to(torch.float16).cuda()
+        drop = torch.rand(ids.shape, generator=gen).cuda() < 0.5
+        ids_m = torch.where(drop, torch.full_like(ids, L.e), ids)   # sentinel E (align: ignore_invalid_expert=True)
+        L.set_table("mixed", torch.rand(L.e, generator=gen).cuda() < 0.5)
+        y = L.run_ptr(x, ids_m, w)
+        exact = exact_layer(x, ids, torch.where(drop, torch.zeros_like(w), w), t_gpu, ref13, ref2, L.inter)
+        err = (y.double() - exact).abs().mean().item() / exact.abs().mean().item()
+        out[str(tokens)] = {"err64": err, "eq_stacked": eq16(y, L.run_stack(x, ids_m, w)), "finite": bool(torch.isfinite(y).all()),
+                            "pass": err < 2e-3 and bool(torch.isfinite(y).all())}
+        print("masked", tokens, out[str(tokens)], flush=True)
+    return out
+
+
+def bench_gather_then_compute(L: Layer, gen, reps: int) -> dict:
+    """1-token decode, all 10 experts miss: graph-safe copy-in (SM gather of the 10 host records into cache slots by
+    torch.index_select on the mapped bank, table rows re-pointed on device) followed by the device-resident layer."""
+    tokens = 1
+    hostv = offload_moe._mod().host_as_cuda(L.host, torch.cuda.current_device())
+    arena = torch.empty((16, L.lay.record_bytes), dtype=torch.uint8, device="cuda")
+    slot_rows = arena[:10]
+    ar10 = torch.arange(10, dtype=torch.int64, device="cuda")
+    ids, w = uniform_routing(tokens, 10, L.e, gen)
+    x = (torch.randn((tokens, L.hidden), generator=gen) * 0.5).to(torch.bfloat16).cuda()
+    L.set_table("host")
+
+    def step():
+        miss = ids.reshape(-1).to(torch.int64)
+        torch.index_select(hostv, 0, miss, out=slot_rows)                          # PCIe: SM gather
+        L.table.index_copy_(0, miss, arena.data_ptr() + ar10.unsqueeze(1) * L.lay.record_bytes + L.offs.unsqueeze(0))
+        return L.run_ptr(x, ids, w)
+
+    s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        step(); step()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        y = step()
+    ts, ok = [], True
+    for i in range(reps + 5):
+        r_ids, r_w = uniform_routing(tokens, 10, L.e, gen)
+        ids.copy_(r_ids); w.copy_(r_w); L.set_table("host"); torch.cuda.synchronize()
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a.record(); g.replay(); b.record(); torch.cuda.synchronize()
+        if i >= 5:
+            ts.append(a.elapsed_time(b) * 1000)
+        if i < 3:
+            ok &= eq16(y, L.run_stack(x, r_ids, r_w))
+    # the gather alone
+    gs = []
+    for _ in range(reps):
+        miss = uniform_routing(1, 10, L.e, gen)[0].reshape(-1).to(torch.int64)
+        torch.cuda.synchronize()
+        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        a.record(); torch.index_select(hostv, 0, miss, out=slot_rows); b.record(); torch.cuda.synchronize()
+        gs.append(a.elapsed_time(b) * 1000)
+    nb = 10 * L.lay.record_bytes
+    return {"median_us": median_ms(ts), "eq_stacked": bool(ok), "gather_only_us": median_ms(gs),
+            "gather_GBps": nb / (median_ms(gs) * 1e-6) / 1e9, "reps": reps}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir")
@@ -304,10 +427,30 @@ def main():
     ap.add_argument("--decode-tokens", default="1,4,16")
     ap.add_argument("--prefill-tokens", default="2048,8192")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--only", default="", help="comma list: k4,gather (run just these extra experiments)")
     a = ap.parse_args()
     torch.cuda.init()
     gen = torch.Generator().manual_seed(a.seed)
+    only = {o for o in a.only.split(",") if o}
+    if "k4" in only:
+        r = check_synthetic_k4(gen)
+        if a.json:
+            json.dump({"k4": r}, open(a.json, "w"), indent=1)
+        if only == {"k4"}:
+            return
     L = Layer(a.model_dir, a.layer)
+    if "masked" in only:
+        r = check_masked(L, gen)
+        if a.json:
+            json.dump({"masked": r}, open(a.json.replace(".json", "_masked.json"), "w"), indent=1)
+    if "gather" in only:
+        r = bench_gather_then_compute(L, gen, a.reps)
+        print("gather_then_compute", r, flush=True)
+        if a.json:
+            json.dump({"gather": r}, open(a.json.replace(".json", "_gather.json"), "w"), indent=1)
+        return
+    if only:
+        return
     res = {"model": a.model_dir, "layer": a.layer, "prefix": L.pre, "experts": L.e, "K": L.bits, "codebook": L.cb,
            "hidden": L.hidden, "inter": L.inter, "record_bytes": L.lay.record_bytes, "offsets": L.lay.offsets,
            "device": torch.cuda.get_device_name(), "load_s": L.load_s}

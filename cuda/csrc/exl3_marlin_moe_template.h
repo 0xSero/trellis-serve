@@ -324,7 +324,7 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
     // B is read from b_ptrs[e * ptr_stride] and its svh from s_ptrs[e * ptr_stride] (int64 addresses: device memory
     // or UVA-mapped pinned host memory = zero-copy over PCIe). The table is read on the device at every moe block,
     // so rewriting it in place between replays keeps captured CUDA graphs valid.
-    const int64_t* __restrict__ b_ptrs, const int64_t* __restrict__ s_ptrs, int ptr_stride) {
+    const int64_t* __restrict__ b_ptrs, const int64_t* __restrict__ s_ptrs, int ptr_stride, int ptr_rows) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -613,8 +613,9 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
     }
 
     if (b_ptrs != nullptr) {  // EXL3 offload: pointer table (B_expert_off stays 0, B itself moves)
-      // a block of an expert outside the table (-1: expert_map'd away) has no valid rows; read a valid expert
-      const int64_t e_row = expert_id < 0 ? 0 : expert_id * ptr_stride;
+      // a block of an expert outside the table (-1, or the sentinel E of an align run without ignore_invalid_expert):
+      // its rows are dropped slots (moe_combine skips them); read a valid expert instead of a bogus address
+      const int64_t e_row = (expert_id < 0 || expert_id >= ptr_rows) ? 0 : expert_id * ptr_stride;
       B = reinterpret_cast<const int4*>(b_ptrs[e_row]);
       if (out_flags & 1) b_bias_ptr = reinterpret_cast<const int4*>(s_ptrs[e_row]);
     } else

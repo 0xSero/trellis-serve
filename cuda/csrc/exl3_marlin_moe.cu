@@ -133,7 +133,7 @@ static void gemm_launch(const half* a_ptr, const int* b_ptr, half* c_ptr, const 
                         const int* expert_ids, const int* num_post_padded, int moe_block_size, int rows, int n, int k,
                         int shard_end, int cb, int bits, int device, cudaStream_t stream, int force_thread_k,
                         int force_thread_n, int scratch, const int64_t* b_ptrs = nullptr,
-                        const int64_t* s_ptrs = nullptr, int ptr_stride = 0) {
+                        const int64_t* s_ptrs = nullptr, int ptr_stride = 0, int ptr_rows = 0) {
   DevState& st = dev_state(device);
   const int thread_m_blocks = (moe_block_size + 15) / 16;
   const bool m8 = moe_block_size == 8;
@@ -197,7 +197,7 @@ static void gemm_launch(const half* a_ptr, const int* b_ptr, half* c_ptr, const 
       sorted_ids, expert_ids, num_post_padded, nullptr, /*top_k=*/1, /*mul_topk_weights=*/false,
       /*num_groups=*/-1, rows, n, k, (int*)st.locks[scratch].data_ptr(), /*has_bias=*/false, /*use_atomic_add=*/false,
       /*use_fp32_reduce=*/true, a_shard_stride, shard_end > 0 ? shard_end : INT_MAX, INT_MAX, INT_MAX, out_flags,
-      b_ptrs, s_ptrs, ptr_stride);
+      b_ptrs, s_ptrs, ptr_stride, ptr_rows);
   // clang-format on
 }
 
@@ -552,7 +552,7 @@ void moe_gemm_ptr(const at::Tensor& a, at::Tensor& c, const at::Tensor& ptrs, in
                                       (const int*)num_post_padded.data_ptr(), (int)moe_block_size, (int)rows, (int)n,
                                       (int)k, (int)shard_end, (int)cb, (int)bits, a.get_device(), stream, (int)thread_k,
                                       (int)thread_n, (int)scratch, tb + field_b, field_s >= 0 ? tb + field_s : nullptr,
-                                      (int)ptrs.size(1));
+                                      (int)ptrs.size(1), (int)ptrs.size(0));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
