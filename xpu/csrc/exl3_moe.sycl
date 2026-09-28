@@ -54,6 +54,16 @@ struct Route {
     const int* act_expert; const int* act_start; const int* act_cnt; const int* n_act;
     const int* act_pstart;          // padded (to MB) row start per active expert (prefill)
     const int* pair_tok; const float* pair_w;
+    // pair mode (small M, no align launch): work item a = pair m*topk + k, expert act_expert[a] = topk_ids (flat),
+    // one row each, pair_w = topk_w (flat). A duplicated expert is read once per pair (rare at M <= 4).
+    int pair_topk = 0;              // > 0: pair mode
+    int npairs = 0;
+    ESIMD_INLINE void get(int a, int& e, int& s0, int& cnt) const {
+        if (pair_topk) { e = act_expert[a]; s0 = a; cnt = 1; }
+        else { e = act_expert[a]; s0 = act_start[a]; cnt = act_cnt[a]; }
+    }
+    ESIMD_INLINE int nact() const { return pair_topk ? npairs : n_act[0]; }
+    ESIMD_INLINE int tok(int s) const { return pair_topk ? s / pair_topk : pair_tok[s]; }
 };
 
 // Prefetch n_rows tile-row strips (NW dwords each, row stride in dwords) into the cache hierarchy, no registers.
@@ -115,8 +125,9 @@ struct GateUpKernel {
         int nbn = I / 128;
         int wg = it.get_group(0);
         int a = wg / nbn, nb = wg % nbn;
-        if (a >= rt.n_act[0]) return;
-        int e = rt.act_expert[a], s0 = rt.act_start[a], cnt = rt.act_cnt[a];
+        if (a >= rt.nact()) return;
+        int e, s0, cnt;
+        rt.get(a, e, s0, cnt);
         const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
         const uint32_t* tr = reinterpret_cast<const uint32_t*>(base);
         int proj = t & 1, strip = (t >> 1) & 1, p = t >> 2;
@@ -129,7 +140,7 @@ struct GateUpKernel {
         for (int c0 = 0; c0 < cnt; c0 += MR) {
             int tok[MR];
 #pragma unroll
-            for (int m = 0; m < MR; ++m) tok[m] = (c0 + m < cnt) ? rt.pair_tok[s0 + c0 + m] : -1;
+            for (int m = 0; m < MR; ++m) tok[m] = (c0 + m < cnt) ? rt.tok(s0 + c0 + m) : -1;
             simd<float, ACC> acc = 0.0f;
             for (int rb = r0; rb < r0 + rps; rb += 8) {
                 int kb = rb / 8;
@@ -248,8 +259,9 @@ struct DownKernel {
         int nbn = H / 128;
         int wg = it.get_group(0);
         int a = wg / nbn, nb = wg % nbn;
-        if (a >= rt.n_act[0]) return;
-        int e = rt.act_expert[a], s0 = rt.act_start[a], cnt = rt.act_cnt[a];
+        if (a >= rt.nact()) return;
+        int e, s0, cnt;
+        rt.get(a, e, s0, cnt);
         const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
         const uint32_t* tr = reinterpret_cast<const uint32_t*>(base + off_d);
         int strip = t & 1, p = t >> 1;
@@ -338,7 +350,7 @@ struct CombineKernel {
         int m = id / nbn, nb = id % nbn;
         if (m >= M) return;
         simd<float, 128> v = 0.0f;
-        for (int k = 0; k < topk; ++k) v += block_load<float, 128>(y + (size_t)pair_of[m * topk + k] * H + nb * 128);
+        for (int k = 0; k < topk; ++k) v += block_load<float, 128>(y + (size_t)(pair_of ? pair_of[m * topk + k] : m * topk + k) * H + nb * 128);
         block_store<TOut, 128>(out + (size_t)m * out_stride + nb * 128, convert<TOut>(v));
     }
 };
@@ -429,7 +441,9 @@ static void down_dispatch(int MR, sycl::queue& q, const fp16* abuf, const int64_
 }
 
 static int g_mr_override = 0;
-static int g_debug_skip = 0;   // timing probes: bit0 gateup, bit1 down, bit2 combine, bit3 align
+static int g_debug_skip = 0;
+static int g_pair_max_m = 4;   // M <= this: pair mode (no align launch)
+void moe_set_pair_max_m(int64_t v) { g_pair_max_m = (int)v; }   // timing probes: bit0 gateup, bit1 down, bit2 combine, bit3 align
 void moe_set_debug(int64_t v) { g_debug_skip = (int)v; }
 void moe_set_mr(int64_t mr) { g_mr_override = (int)mr; }
 
@@ -468,14 +482,19 @@ at::Tensor moe_forward(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, at:
     auto& q = queue_of(x);
     Geom gm{H, (int)I, (int)K};
     int npairs = M * topk;
-    auto rb = make_route(x, npairs, E);
-    if (!(g_debug_skip & 8)) launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, 1, rb.act_expert,
+    bool pair_mode = M <= g_pair_max_m;
+    auto rb = make_route(x, pair_mode ? 1 : npairs, E);
+    if (pair_mode) {
+        rb.rt = Route{topk_ids.data_ptr<int>(), nullptr, nullptr, nullptr, nullptr, nullptr, topk_w.data_ptr<float>(), topk, npairs};
+        rb.pair_of = nullptr;
+    } else if (!(g_debug_skip & 8)) launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, 1, rb.act_expert,
                  rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of);
-    int max_act = std::min(npairs, E);
+    int max_act = pair_mode ? npairs : std::min(npairs, E);
     auto abuf = at::empty({npairs, I}, x.options().dtype(at::kHalf));
     auto y = at::empty({npairs, H}, x.options().dtype(at::kFloat));
     // rows per expert chunk: 1 at M=1, else up to 4 (8 for bigger batches)
-    int MR = g_mr_override ? g_mr_override : (M <= 1 ? 1 : (M <= 4 ? 2 : (M <= 32 ? 4 : 8)));
+    // B70, layer-0 experts, device slots: grouped M=16 MR=1/2/4 = 723/693/734 us; pair mode wins M<=4 (no align).
+    int MR = pair_mode ? 1 : g_mr_override ? g_mr_override : (M <= 64 ? 2 : 4);
     const int64_t* pp = ptrs.data_ptr<int64_t>();
     fp16* ab = reinterpret_cast<fp16*>(abuf.data_ptr());
     TORCH_CHECK(K == 3, "moe: K=3 only in this build");
@@ -545,4 +564,5 @@ TORCH_LIBRARY(exl3xpu_moe, m) {
     m.def("moe_set_splits(int gu_p, int dn_p) -> ()", &moe::moe_set_splits);
     m.def("moe_set_mr(int mr) -> ()", &moe::moe_set_mr);
     m.def("moe_set_debug(int v) -> ()", &moe::moe_set_debug);
+    m.def("moe_set_pair_max_m(int v) -> ()", &moe::moe_set_pair_max_m);
 }

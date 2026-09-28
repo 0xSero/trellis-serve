@@ -39,6 +39,8 @@ if args.splits:
     X.moe_set_splits(*[int(v) for v in args.splits.split(",")])
 if args.mr:
     X.moe_set_mr(args.mr)
+if os.environ.get("MOE_PAIR_MAX_M"):
+    X.moe_set_pair_max_m(int(os.environ["MOE_PAIR_MAX_M"]))
 if os.environ.get("MOE_DEBUG_SKIP"):
     X.moe_set_debug(int(os.environ["MOE_DEBUG_SKIP"]))
 dt = torch.bfloat16 if args.dtype == "bf16" else torch.float16
