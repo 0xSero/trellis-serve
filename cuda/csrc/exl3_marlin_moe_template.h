@@ -319,7 +319,12 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
     // Had128 -> * svh to the finished fp16 rows while they sit in shared memory (svh = `b_bias_ptr`, fp16
     // [num_experts, prob_n], advanced per expert like Marlin's bias; needs thread_n % 128 == 0); bit 1: store the
     // result as bf16 bits. 0 = plain GEMM.
-    int out_flags) {
+    int out_flags,
+    // EXL3 offload: per-expert POINTER TABLE (nullptr = stacked [E, ...] B / svh as before). When set, expert e's
+    // B is read from b_ptrs[e * ptr_stride] and its svh from s_ptrs[e * ptr_stride] (int64 addresses: device memory
+    // or UVA-mapped pinned host memory = zero-copy over PCIe). The table is read on the device at every moe block,
+    // so rewriting it in place between replays keeps captured CUDA graphs valid.
+    const int64_t* __restrict__ b_ptrs, const int64_t* __restrict__ s_ptrs, int ptr_stride) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -607,6 +612,12 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
       global_scale_f32 = global_scale_ptr[expert_id];
     }
 
+    if (b_ptrs != nullptr) {  // EXL3 offload: pointer table (B_expert_off stays 0, B itself moves)
+      // a block of an expert outside the table (-1: expert_map'd away) has no valid rows; read a valid expert
+      const int64_t e_row = expert_id < 0 ? 0 : expert_id * ptr_stride;
+      B = reinterpret_cast<const int4*>(b_ptrs[e_row]);
+      if (out_flags & 1) b_bias_ptr = reinterpret_cast<const int4*>(s_ptrs[e_row]);
+    } else
     B_expert_off = exl3_k3 ? expert_id * (prob_k / 16) * (prob_n * 3 / 8)
                            : expert_id * prob_n * prob_k / (pack_factor * 4);
     scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
@@ -616,7 +627,7 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
     if constexpr (has_act_order) {
       g_idx += (expert_id - old_expert_id) * prob_k;
     }
-    if (has_bias || (out_flags & 1)) {  // EXL3: svh [num_experts, prob_n] travels in b_bias_ptr
+    if ((has_bias || (out_flags & 1)) && b_ptrs == nullptr) {  // EXL3: svh [num_experts, prob_n] travels in b_bias_ptr
       b_bias_ptr += (expert_id - old_expert_id) * b_bias_expert_stride;
     }
 

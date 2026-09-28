@@ -132,7 +132,8 @@ static DevState& dev_state(int device) {
 static void gemm_launch(const half* a_ptr, const int* b_ptr, half* c_ptr, const half* svh, const int* sorted_ids,
                         const int* expert_ids, const int* num_post_padded, int moe_block_size, int rows, int n, int k,
                         int shard_end, int cb, int bits, int device, cudaStream_t stream, int force_thread_k,
-                        int force_thread_n, int scratch) {
+                        int force_thread_n, int scratch, const int64_t* b_ptrs = nullptr,
+                        const int64_t* s_ptrs = nullptr, int ptr_stride = 0) {
   DevState& st = dev_state(device);
   const int thread_m_blocks = (moe_block_size + 15) / 16;
   const bool m8 = moe_block_size == 8;
@@ -195,7 +196,8 @@ static void gemm_launch(const half* a_ptr, const int* b_ptr, half* c_ptr, const 
       nullptr, lut_ptr, nullptr, nullptr, nullptr,
       sorted_ids, expert_ids, num_post_padded, nullptr, /*top_k=*/1, /*mul_topk_weights=*/false,
       /*num_groups=*/-1, rows, n, k, (int*)st.locks[scratch].data_ptr(), /*has_bias=*/false, /*use_atomic_add=*/false,
-      /*use_fp32_reduce=*/true, a_shard_stride, shard_end > 0 ? shard_end : INT_MAX, INT_MAX, INT_MAX, out_flags);
+      /*use_fp32_reduce=*/true, a_shard_stride, shard_end > 0 ? shard_end : INT_MAX, INT_MAX, INT_MAX, out_flags,
+      b_ptrs, s_ptrs, ptr_stride);
   // clang-format on
 }
 
@@ -211,7 +213,7 @@ template <bool in_bf16, bool ids64>
 __global__ __launch_bounds__(32)
 void trellis_moe_had_in_kernel(const half* __restrict__ x, half* __restrict__ xh, const half* __restrict__ suh,
                               const void* __restrict__ ids, const int slots, const int top_k, const int shards,
-                              const int num_experts) {
+                              const int num_experts, const int64_t* __restrict__ ptrs, const int pstride) {
   const size_t width = (size_t)gridDim.y * 128;
   const int slot = blockIdx.x % slots, shard = blockIdx.x / slots;
   int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
@@ -220,8 +222,8 @@ void trellis_moe_had_in_kernel(const half* __restrict__ x, half* __restrict__ xh
   if (e < 0 || e >= num_experts) e = 0;
   const half* in = x + width * (slot / top_k) + blockIdx.y * 128;
   half* out = xh + width * blockIdx.x + blockIdx.y * 128;
-  trellis_had_r_128_inner<in_bf16, false, true, false>(in, out, suh + width * (e * shards + shard), blockIdx.y * 32,
-                                                      kHadScale);
+  const half* su = ptrs ? reinterpret_cast<const half*>(ptrs[e * pstride]) + width * shard : suh + width * (e * shards + shard);
+  trellis_had_r_128_inner<in_bf16, false, true, false>(in, out, su, blockIdx.y * 32, kHadScale);
 }
 
 // ExLlamaV3's fp32 SiLU (exl3_moe_coop_kernel.cuh act_silu)
@@ -237,7 +239,8 @@ __device__ __forceinline__ float trellis_act_silu(float x) {
 template <bool ids64>
 __global__ __launch_bounds__(32)
 void trellis_moe_glu_had_in_kernel(const half* __restrict__ gu, half* __restrict__ xd, half* __restrict__ act_tmp,
-                                  const half* __restrict__ suh, const void* __restrict__ ids, const int num_experts) {
+                                  const half* __restrict__ suh, const void* __restrict__ ids, const int num_experts,
+                                  const int64_t* __restrict__ ptrs, const int pstride) {
   const size_t inter = (size_t)gridDim.y * 128;
   const int slot = blockIdx.x;
   const int t = threadIdx.x & 31;
@@ -253,8 +256,8 @@ void trellis_moe_glu_had_in_kernel(const half* __restrict__ gu, half* __restrict
   half* act = act_tmp + inter * slot + blockIdx.y * 128;
   ((half4*)act)[t] = a;
   __syncthreads();
-  trellis_had_r_128_inner<false, false, true, false>(act, xd + inter * slot + blockIdx.y * 128, suh + inter * e,
-                                                    blockIdx.y * 32, kHadScale);
+  const half* su = ptrs ? reinterpret_cast<const half*>(ptrs[e * pstride]) : suh + inter * e;
+  trellis_had_r_128_inner<false, false, true, false>(act, xd + inter * slot + blockIdx.y * 128, su, blockIdx.y * 32, kHadScale);
 }
 
 // y[t] = sum_j w[t, j] * yd[t * top_k + j], fp32 accumulation in slot order, one rounding to fp16 / bf16.
@@ -314,7 +317,7 @@ template <bool in_bf16, bool ids64>
 __global__ __launch_bounds__(256)
 void trellis_moe_had_in_gs_kernel(const half* __restrict__ x, half* __restrict__ xh, const half* __restrict__ suh,
                                  const void* __restrict__ ids, const int slots, const int top_k, const int shards,
-                                 const int num_experts, const int kb) {
+                                 const int num_experts, const int kb, const int64_t* __restrict__ ptrs, const int pstride) {
   const size_t width = (size_t)kb * 128;
   const int64_t total = (int64_t)shards * slots * kb, stride = (int64_t)gridDim.x * 8;
   for (int64_t w = (int64_t)blockIdx.x * 8 + threadIdx.x / 32; w < total; w += stride) {
@@ -323,8 +326,9 @@ void trellis_moe_had_in_gs_kernel(const half* __restrict__ x, half* __restrict__
     const int slot = (int)(rs % slots), shard = (int)(rs / slots);
     int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
     if (e < 0 || e >= num_experts) e = 0;
+    const half* su = ptrs ? reinterpret_cast<const half*>(ptrs[e * pstride]) + width * shard : suh + width * (e * shards + shard);
     trellis_had_r_128_inner<in_bf16, false, true, false>(x + width * (slot / top_k) + blk * 128, xh + width * rs + blk * 128,
-                                                        suh + width * (e * shards + shard), blk * 32, kHadScale);
+                                                        su, blk * 32, kHadScale);
   }
 }
 
@@ -332,7 +336,7 @@ template <bool ids64>
 __global__ __launch_bounds__(256)
 void trellis_moe_glu_had_in_gs_kernel(const half* __restrict__ gu, half* __restrict__ xd, half* __restrict__ act_tmp,
                                      const half* __restrict__ suh, const void* __restrict__ ids, const int num_experts,
-                                     const int slots, const int kb) {
+                                     const int slots, const int kb, const int64_t* __restrict__ ptrs, const int pstride) {
   const size_t inter = (size_t)kb * 128;
   const int64_t total = (int64_t)slots * kb, stride = (int64_t)gridDim.x * 8;
   const int t = threadIdx.x & 31;
@@ -351,7 +355,8 @@ void trellis_moe_glu_had_in_gs_kernel(const half* __restrict__ gu, half* __restr
     ((half4*)act)[t] = a;
     // No __syncthreads() here: it would synchronise the whole 256-thread block, and the 8 warps of a block have
     // different trip counts at the tail (hang). Each lane reads back only the vector it has just written itself.
-    trellis_had_r_128_inner<false, false, true, false>(act, xd + inter * slot + blk * 128, suh + inter * e, blk * 32, kHadScale);
+    const half* su = ptrs ? reinterpret_cast<const half*>(ptrs[e * pstride]) : suh + inter * e;
+    trellis_had_r_128_inner<false, false, true, false>(act, xd + inter * slot + blk * 128, su, blk * 32, kHadScale);
   }
 }
 
@@ -407,37 +412,73 @@ void moe_gemm(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, const c10
                                       (int)thread_n, (int)scratch);
 }
 
-// xh [shards * slots, k] fp16 <- x [tokens, k] fp16 | bf16, suh [E, shards, k] fp16, ids [tokens, top_k] int32 | int64
-void moe_had_in(const at::Tensor& x, const at::Tensor& suh, const at::Tensor& ids, at::Tensor& xh) {
-  const at::cuda::OptionalCUDAGuard device_guard(x.device());
+// Shared launcher of the input transform. suh: stacked fp16 [E, shards, k] (ptrs == nullptr) or, pointer mode, expert
+// e's [shards, k] fp16 at ptrs[e * pstride] (the caller passes the table already offset to its field).
+static void had_in_launch(const at::Tensor& x, const half* sp, int64_t num_experts, int64_t shards, const at::Tensor& ids,
+                          at::Tensor& xh, const int64_t* ptrs, int pstride) {
   TORCH_CHECK(x.dim() == 2 && is_16bit_float(x) && x.is_contiguous() && x.size(1) % 128 == 0);
   TORCH_CHECK(ids.dim() == 2 && is_index(ids) && ids.is_contiguous() && ids.size(0) == x.size(0));
-  TORCH_CHECK(suh.dim() == 3 && suh.dtype() == at::kHalf && suh.is_contiguous() && suh.size(2) == x.size(1));
-  const int64_t tokens = x.size(0), k = x.size(1), top_k = ids.size(1), shards = suh.size(1), slots = tokens * top_k;
+  const int64_t tokens = x.size(0), k = x.size(1), top_k = ids.size(1), slots = tokens * top_k;
   TORCH_CHECK(xh.dtype() == at::kHalf && xh.is_contiguous() && xh.numel() >= shards * slots * k);
   if (slots == 0) return;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   dim3 grid((unsigned)(shards * slots), (unsigned)(k / 128));
   const bool bf = x.dtype() == at::kBFloat16, i64 = ids.dtype() == at::kLong;
   const half* xp = (const half*)x.data_ptr(); half* op = (half*)xh.data_ptr();
-  const half* sp = (const half*)suh.data_ptr(); const void* ip = ids.data_ptr();
+  const void* ip = ids.data_ptr();
+  const int ne = (int)num_experts, sl = (int)slots, tk = (int)top_k, sh = (int)shards;
   if (const int gsb = gs_blocks_for(shards * slots * (k / 128)); gsb > 0) {
-    const int kb = (int)(k / 128), ne = (int)suh.size(0);
+    const int kb = (int)(k / 128);
     const int64_t warps = shards * slots * kb;
     const int gb = (int)std::min<int64_t>(gsb, (warps + 7) / 8);
     // clang-format off
-    if (bf && i64)  trellis_moe_had_in_gs_kernel<true, true><<<gb, 256, 0, stream>>>(xp, op, sp, ip, (int)slots, (int)top_k, (int)shards, ne, kb);
-    else if (bf)    trellis_moe_had_in_gs_kernel<true, false><<<gb, 256, 0, stream>>>(xp, op, sp, ip, (int)slots, (int)top_k, (int)shards, ne, kb);
-    else if (i64)   trellis_moe_had_in_gs_kernel<false, true><<<gb, 256, 0, stream>>>(xp, op, sp, ip, (int)slots, (int)top_k, (int)shards, ne, kb);
-    else            trellis_moe_had_in_gs_kernel<false, false><<<gb, 256, 0, stream>>>(xp, op, sp, ip, (int)slots, (int)top_k, (int)shards, ne, kb);
+    if (bf && i64)  trellis_moe_had_in_gs_kernel<true, true><<<gb, 256, 0, stream>>>(xp, op, sp, ip, sl, tk, sh, ne, kb, ptrs, pstride);
+    else if (bf)    trellis_moe_had_in_gs_kernel<true, false><<<gb, 256, 0, stream>>>(xp, op, sp, ip, sl, tk, sh, ne, kb, ptrs, pstride);
+    else if (i64)   trellis_moe_had_in_gs_kernel<false, true><<<gb, 256, 0, stream>>>(xp, op, sp, ip, sl, tk, sh, ne, kb, ptrs, pstride);
+    else            trellis_moe_had_in_gs_kernel<false, false><<<gb, 256, 0, stream>>>(xp, op, sp, ip, sl, tk, sh, ne, kb, ptrs, pstride);
     // clang-format on
     return;
   }
   // clang-format off
-  if (bf && i64)       trellis_moe_had_in_kernel<true, true><<<grid, 32, 0, stream>>>(xp, op, sp, ip, (int)slots, (int)top_k, (int)shards, (int)suh.size(0));
-  else if (bf)         trellis_moe_had_in_kernel<true, false><<<grid, 32, 0, stream>>>(xp, op, sp, ip, (int)slots, (int)top_k, (int)shards, (int)suh.size(0));
-  else if (i64)        trellis_moe_had_in_kernel<false, true><<<grid, 32, 0, stream>>>(xp, op, sp, ip, (int)slots, (int)top_k, (int)shards, (int)suh.size(0));
-  else                 trellis_moe_had_in_kernel<false, false><<<grid, 32, 0, stream>>>(xp, op, sp, ip, (int)slots, (int)top_k, (int)shards, (int)suh.size(0));
+  if (bf && i64)       trellis_moe_had_in_kernel<true, true><<<grid, 32, 0, stream>>>(xp, op, sp, ip, sl, tk, sh, ne, ptrs, pstride);
+  else if (bf)         trellis_moe_had_in_kernel<true, false><<<grid, 32, 0, stream>>>(xp, op, sp, ip, sl, tk, sh, ne, ptrs, pstride);
+  else if (i64)        trellis_moe_had_in_kernel<false, true><<<grid, 32, 0, stream>>>(xp, op, sp, ip, sl, tk, sh, ne, ptrs, pstride);
+  else                 trellis_moe_had_in_kernel<false, false><<<grid, 32, 0, stream>>>(xp, op, sp, ip, sl, tk, sh, ne, ptrs, pstride);
+  // clang-format on
+}
+
+// xh [shards * slots, k] fp16 <- x [tokens, k] fp16 | bf16, suh [E, shards, k] fp16, ids [tokens, top_k] int32 | int64
+void moe_had_in(const at::Tensor& x, const at::Tensor& suh, const at::Tensor& ids, at::Tensor& xh) {
+  const at::cuda::OptionalCUDAGuard device_guard(x.device());
+  TORCH_CHECK(suh.dim() == 3 && suh.dtype() == at::kHalf && suh.is_contiguous() && suh.size(2) == x.size(1));
+  had_in_launch(x, (const half*)suh.data_ptr(), suh.size(0), suh.size(1), ids, xh, nullptr, 0);
+}
+
+static void glu_launch(const at::Tensor& gu, const half* sp, int64_t num_experts, const at::Tensor& ids,
+                       at::Tensor& act_tmp, at::Tensor& xd, const int64_t* ptrs, int pstride) {
+  TORCH_CHECK(gu.dim() == 2 && gu.dtype() == at::kHalf && gu.is_contiguous() && gu.size(1) % 256 == 0);
+  const int64_t slots = gu.size(0), inter = gu.size(1) / 2;
+  TORCH_CHECK(is_index(ids) && ids.is_contiguous() && ids.numel() == slots);
+  TORCH_CHECK(xd.dtype() == at::kHalf && xd.is_contiguous() && xd.numel() >= slots * inter);
+  TORCH_CHECK(act_tmp.dtype() == at::kHalf && act_tmp.is_contiguous() && act_tmp.numel() >= slots * inter);
+  TORCH_CHECK(act_tmp.data_ptr() != xd.data_ptr() && act_tmp.data_ptr() != gu.data_ptr());
+  if (slots == 0) return;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  dim3 grid((unsigned)slots, (unsigned)(inter / 128));
+  const int ne = (int)num_experts;
+  const half* gp = (const half*)gu.data_ptr(); half* xp = (half*)xd.data_ptr(); half* ap = (half*)act_tmp.data_ptr();
+  if (const int gsb = gs_blocks_for(slots * (inter / 128)); gsb > 0) {
+    const int kb = (int)(inter / 128);
+    const int gb = (int)std::min<int64_t>(gsb, (slots * kb + 7) / 8);
+    // clang-format off
+    if (ids.dtype() == at::kLong) trellis_moe_glu_had_in_gs_kernel<true><<<gb, 256, 0, stream>>>(gp, xp, ap, sp, ids.data_ptr(), ne, (int)slots, kb, ptrs, pstride);
+    else                          trellis_moe_glu_had_in_gs_kernel<false><<<gb, 256, 0, stream>>>(gp, xp, ap, sp, ids.data_ptr(), ne, (int)slots, kb, ptrs, pstride);
+    // clang-format on
+    return;
+  }
+  // clang-format off
+  if (ids.dtype() == at::kLong) trellis_moe_glu_had_in_kernel<true><<<grid, 32, 0, stream>>>(gp, xp, ap, sp, ids.data_ptr(), ne, ptrs, pstride);
+  else                          trellis_moe_glu_had_in_kernel<false><<<grid, 32, 0, stream>>>(gp, xp, ap, sp, ids.data_ptr(), ne, ptrs, pstride);
   // clang-format on
 }
 
@@ -446,33 +487,104 @@ void moe_had_in(const at::Tensor& x, const at::Tensor& suh, const at::Tensor& id
 void moe_glu_had_in(const at::Tensor& gu, const at::Tensor& suh, const at::Tensor& ids, at::Tensor& act_tmp,
                     at::Tensor& xd) {
   const at::cuda::OptionalCUDAGuard device_guard(gu.device());
-  TORCH_CHECK(gu.dim() == 2 && gu.dtype() == at::kHalf && gu.is_contiguous() && gu.size(1) % 256 == 0);
-  const int64_t slots = gu.size(0), inter = gu.size(1) / 2;
-  TORCH_CHECK(is_index(ids) && ids.is_contiguous() && ids.numel() == slots);
-  TORCH_CHECK(suh.dim() == 2 && suh.dtype() == at::kHalf && suh.is_contiguous() && suh.size(1) == inter);
-  TORCH_CHECK(xd.dtype() == at::kHalf && xd.is_contiguous() && xd.numel() >= slots * inter);
-  TORCH_CHECK(act_tmp.dtype() == at::kHalf && act_tmp.is_contiguous() && act_tmp.numel() >= slots * inter);
-  TORCH_CHECK(act_tmp.data_ptr() != xd.data_ptr() && act_tmp.data_ptr() != gu.data_ptr());
-  if (slots == 0) return;
+  TORCH_CHECK(suh.dim() == 2 && suh.dtype() == at::kHalf && suh.is_contiguous() && suh.size(1) * 2 == gu.size(1));
+  glu_launch(gu, (const half*)suh.data_ptr(), suh.size(0), ids, act_tmp, xd, nullptr, 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Pointer-table (offload) entry points. ptrs: int64 CUDA [E, F] contiguous; row e = addresses of logical expert e's
+// fields (device memory or UVA-mapped pinned host memory). Fields used here are chosen by the caller (see
+// kernels/offload_moe.py: 0 w13, 1 w2, 2 suh13 [2, H], 3 svh13 [2I], 4 suh2 [I], 5 svh2 [H]). Every address must be
+// 16-byte aligned. Shapes/strides of each field are those of ONE expert of the stacked pack (marlin_moe.prepare).
+
+static void check_ptrs(const at::Tensor& ptrs, int64_t field) {
+  TORCH_CHECK(ptrs.is_cuda() && ptrs.dtype() == at::kLong && ptrs.dim() == 2 && ptrs.is_contiguous(),
+              "ptrs must be a contiguous int64 CUDA tensor [E, F]");
+  TORCH_CHECK(field >= 0 && field < ptrs.size(1), "pointer-table field out of range");
+}
+
+void moe_had_in_ptr(const at::Tensor& x, const at::Tensor& ptrs, int64_t field, int64_t shards, const at::Tensor& ids,
+                    at::Tensor& xh) {
+  const at::cuda::OptionalCUDAGuard device_guard(x.device());
+  check_ptrs(ptrs, field);
+  TORCH_CHECK(shards == 1 || shards == 2);
+  had_in_launch(x, nullptr, ptrs.size(0), shards, ids, xh, ptrs.data_ptr<int64_t>() + field, (int)ptrs.size(1));
+}
+
+void moe_glu_had_in_ptr(const at::Tensor& gu, const at::Tensor& ptrs, int64_t field, const at::Tensor& ids,
+                        at::Tensor& act_tmp, at::Tensor& xd) {
+  const at::cuda::OptionalCUDAGuard device_guard(gu.device());
+  check_ptrs(ptrs, field);
+  glu_launch(gu, nullptr, ptrs.size(0), ids, act_tmp, xd, ptrs.data_ptr<int64_t>() + field, (int)ptrs.size(1));
+}
+
+// Grouped GEMM with B (and svh, field_s >= 0) from the pointer table. a fp16 [shards * rows, k], c fp16 [rows, n];
+// bits = EXL3 K of every expert (3 or 4); B layout per expert: [k/16, n/64, 4, 24] int32 (K=3) / [k/16, n/64, 32, 4] (K=4).
+void moe_gemm_ptr(const at::Tensor& a, at::Tensor& c, const at::Tensor& ptrs, int64_t field_b, int64_t field_s,
+                  int64_t bits, const at::Tensor& sorted_ids, const at::Tensor& expert_ids,
+                  const at::Tensor& num_post_padded, int64_t moe_block_size, int64_t shard_end, int64_t cb,
+                  int64_t thread_k, int64_t thread_n, int64_t scratch) {
+  const at::cuda::OptionalCUDAGuard device_guard(a.device());
+  TORCH_CHECK(a.dim() == 2 && c.dim() == 2 && a.dtype() == at::kHalf && c.dtype() == at::kHalf);
+  TORCH_CHECK(a.is_contiguous() && c.is_contiguous());
+  check_ptrs(ptrs, field_b);
+  TORCH_CHECK(field_s < ptrs.size(1));
+  TORCH_CHECK(bits == 3 || bits == 4, "pointer-table GEMM: K = 3 or 4");
+  const int64_t rows = c.size(0), k = a.size(1), n = c.size(1), shards = shard_end > 0 ? 2 : 1;
+  TORCH_CHECK(a.size(0) == shards * rows, "a must be [shards * rows, k]");
+  TORCH_CHECK(k % 128 == 0 && n % 128 == 0);
+  TORCH_CHECK(moe_block_size == 8 || (moe_block_size % 16 == 0 && moe_block_size >= 16 && moe_block_size <= 64),
+              "unsupported moe_block_size ", moe_block_size);
+  TORCH_CHECK(sorted_ids.dtype() == at::kInt && expert_ids.dtype() == at::kInt && num_post_padded.dtype() == at::kInt);
+  TORCH_CHECK(sorted_ids.is_contiguous() && expert_ids.is_contiguous() && num_post_padded.numel() == 1);
+  TORCH_CHECK(expert_ids.numel() >= sorted_ids.numel() / moe_block_size, "expert_ids too short");
+  TORCH_CHECK(shard_end >= 0 && shard_end < n && shard_end % 128 == 0);
+  TORCH_CHECK((int64_t)shards * rows * (k / 8) < INT_MAX, "input slabs exceed the kernel's 32-bit offsets");
+  TORCH_CHECK(scratch == 0 || scratch == 1, "scratch must be 0 or 1");
+  if (rows == 0) return;
+  const int64_t* tb = ptrs.data_ptr<int64_t>();
+  // B / svh arguments must be non-null for the launcher's config logic (svh != nullptr = output transform);
+  // the kernel replaces them from the table before any use.
+  const half* svh_dummy = field_s >= 0 ? (const half*)c.data_ptr() : nullptr;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  dim3 grid((unsigned)slots, (unsigned)(inter / 128));
-  if (const int gsb = gs_blocks_for(slots * (inter / 128)); gsb > 0) {
-    const int kb = (int)(inter / 128), ne = (int)suh.size(0);
-    const int gb = (int)std::min<int64_t>(gsb, (slots * kb + 7) / 8);
-    // clang-format off
-    if (ids.dtype() == at::kLong)
-      trellis_moe_glu_had_in_gs_kernel<true><<<gb, 256, 0, stream>>>((const half*)gu.data_ptr(), (half*)xd.data_ptr(), (half*)act_tmp.data_ptr(), (const half*)suh.data_ptr(), ids.data_ptr(), ne, (int)slots, kb);
-    else
-      trellis_moe_glu_had_in_gs_kernel<false><<<gb, 256, 0, stream>>>((const half*)gu.data_ptr(), (half*)xd.data_ptr(), (half*)act_tmp.data_ptr(), (const half*)suh.data_ptr(), ids.data_ptr(), ne, (int)slots, kb);
-    // clang-format on
-    return;
-  }
-  // clang-format off
-  if (ids.dtype() == at::kLong)
-    trellis_moe_glu_had_in_kernel<true><<<grid, 32, 0, stream>>>((const half*)gu.data_ptr(), (half*)xd.data_ptr(), (half*)act_tmp.data_ptr(), (const half*)suh.data_ptr(), ids.data_ptr(), (int)suh.size(0));
-  else
-    trellis_moe_glu_had_in_kernel<false><<<grid, 32, 0, stream>>>((const half*)gu.data_ptr(), (half*)xd.data_ptr(), (half*)act_tmp.data_ptr(), (const half*)suh.data_ptr(), ids.data_ptr(), (int)suh.size(0));
-  // clang-format on
+  trellis_exl3_marlin_moe::gemm_launch((const half*)a.data_ptr(), (const int*)a.data_ptr(), (half*)c.data_ptr(), svh_dummy,
+                                      (const int*)sorted_ids.data_ptr(), (const int*)expert_ids.data_ptr(),
+                                      (const int*)num_post_padded.data_ptr(), (int)moe_block_size, (int)rows, (int)n,
+                                      (int)k, (int)shard_end, (int)cb, (int)bits, a.get_device(), stream, (int)thread_k,
+                                      (int)thread_n, (int)scratch, tb + field_b, field_s >= 0 ? tb + field_s : nullptr,
+                                      (int)ptrs.size(1));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Host tier helpers: pinned + mapped host memory whose UVA address the kernels can dereference (zero-copy over PCIe).
+
+// uint8 CPU tensor of `bytes` from cudaHostAlloc(Portable | Mapped) (exact size: no power-of-two rounding as in torch's
+// caching host allocator); freed with cudaFreeHost when the tensor dies.
+at::Tensor host_alloc_mapped(int64_t bytes) {
+  void* p = nullptr;
+  cudaError_t err = cudaHostAlloc(&p, (size_t)bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+  TORCH_CHECK(err == cudaSuccess, "cudaHostAlloc(", bytes, ") failed: ", cudaGetErrorString(err));
+  return at::from_blob(p, {bytes}, [](void* q) { cudaFreeHost(q); }, at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+}
+
+// Pin + map an existing CPU tensor's memory in place (pin-after-fill); returns nothing, undo with host_unregister.
+void host_register(const at::Tensor& t) {
+  TORCH_CHECK(t.device().is_cpu() && t.is_contiguous());
+  cudaError_t err = cudaHostRegister(t.data_ptr(), (size_t)t.nbytes(), cudaHostRegisterPortable | cudaHostRegisterMapped);
+  TORCH_CHECK(err == cudaSuccess, "cudaHostRegister failed: ", cudaGetErrorString(err));
+}
+
+void host_unregister(const at::Tensor& t) {
+  cudaError_t err = cudaHostUnregister(t.data_ptr());
+  TORCH_CHECK(err == cudaSuccess, "cudaHostUnregister failed: ", cudaGetErrorString(err));
+}
+
+// Device-visible address of pinned + mapped host memory (== the host address on UVA systems).
+int64_t host_device_ptr(const at::Tensor& t) {
+  void* d = nullptr;
+  cudaError_t err = cudaHostGetDevicePointer(&d, t.data_ptr(), 0);
+  TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed (memory not pinned+mapped?): ", cudaGetErrorString(err));
+  return (int64_t)d;
 }
 
 // y [tokens, hidden] fp16 | bf16 <- yd [tokens * top_k, hidden] fp16, w [tokens, top_k] float32; slots whose id is
@@ -518,6 +630,17 @@ void moe_set_blocks_per_sm(int64_t n) {
 void moe_set_grid_limit(int64_t n) {
   TORCH_CHECK(n >= 0);
   trellis_exl3_marlin_moe::g_grid_limit = (int)n;
+}
+
+// The same host memory seen as a CUDA tensor (same sizes / strides / dtype, UVA device address): torch ops on it read
+// host memory from the SMs over PCIe (zero-copy). Keeps the host tensor alive.
+at::Tensor host_as_cuda(const at::Tensor& t, int64_t device) {
+  void* d = nullptr;
+  cudaError_t err = cudaHostGetDevicePointer(&d, t.data_ptr(), 0);
+  TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed (memory not pinned+mapped?): ", cudaGetErrorString(err));
+  at::Tensor keep = t;
+  return at::from_blob(d, t.sizes(), t.strides(), [keep](void*) {},
+                       at::TensorOptions().dtype(t.dtype()).device(at::Device(at::kCUDA, (int)device)));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -619,6 +742,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_had_in", &moe_had_in, "per-slot input transform with per-expert suh (gather + scale + Had128)");
   m.def("moe_glu_had_in", &moe_glu_had_in, "silu(gate) * up -> fp16 -> per-expert suh -> Had128 (down input)");
   m.def("moe_combine", &moe_combine, "router-weighted fp32 sum over a token's top-k slots");
+  m.def("moe_gemm_ptr", &moe_gemm_ptr, "grouped EXL3 GEMM, experts addressed through an int64 pointer table [E, F]",
+        py::arg("a"), py::arg("c"), py::arg("ptrs"), py::arg("field_b"), py::arg("field_s"), py::arg("bits"),
+        py::arg("sorted_ids"), py::arg("expert_ids"), py::arg("num_post_padded"), py::arg("moe_block_size"),
+        py::arg("shard_end"), py::arg("cb"), py::arg("thread_k") = -1, py::arg("thread_n") = -1, py::arg("scratch") = 0);
+  m.def("moe_had_in_ptr", &moe_had_in_ptr, "moe_had_in with suh from the pointer table",
+        py::arg("x"), py::arg("ptrs"), py::arg("field"), py::arg("shards"), py::arg("ids"), py::arg("xh"));
+  m.def("moe_glu_had_in_ptr", &moe_glu_had_in_ptr, "moe_glu_had_in with suh_down from the pointer table",
+        py::arg("gu"), py::arg("ptrs"), py::arg("field"), py::arg("ids"), py::arg("act_tmp"), py::arg("xd"));
+  m.def("host_alloc_mapped", &host_alloc_mapped, "uint8 CPU tensor from cudaHostAlloc(Portable|Mapped), exact size");
+  m.def("host_register", &host_register, "cudaHostRegister(Portable|Mapped) a CPU tensor in place");
+  m.def("host_unregister", &host_unregister, "cudaHostUnregister");
+  m.def("host_device_ptr", &host_device_ptr, "device (UVA) address of pinned+mapped host memory");
+  m.def("host_as_cuda", &host_as_cuda, "pinned+mapped host tensor viewed as a CUDA tensor (zero-copy)");
   m.def("moe_init_device", &moe_init_device, "allocate per-device state (locks, fp32 reduce scratch)");
   m.def("moe_set_gridstride_blocks", &moe_set_gridstride_blocks,
         "knob: -1 = automatic (default), 0 = one 32-thread block per (row, 128-block) item in the per-slot transforms, n > 0 = n grid-strided 256-thread blocks");
