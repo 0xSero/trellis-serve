@@ -41,6 +41,8 @@ if args.splits:
     X.moe_set_splits(*[int(v) for v in args.splits.split(",")])
 if args.mr:
     X.moe_set_mr(args.mr)
+if os.environ.get("MOE_PREFILL_MIN_M"):
+    X.moe_set_prefill_min_m(int(os.environ["MOE_PREFILL_MIN_M"]))
 if os.environ.get("MOE_PAIR_MAX_M"):
     X.moe_set_pair_max_m(int(os.environ["MOE_PAIR_MAX_M"]))
 if os.environ.get("MOE_DEBUG_SKIP"):

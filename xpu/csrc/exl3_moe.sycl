@@ -753,7 +753,9 @@ static RouteBufs make_route(const at::Tensor& like, int npairs, int E, int mb = 
     return r;
 }
 
-static int g_prefill_min_m = 64;   // M >= this: DPAS prefill path
+// GEMV vs DPAS on B70 (us/layer, device): M=96 2323 vs 2977, 128 2669 vs 3253, 192 3195 (MR4) vs 3353, 256 3536 (MR8) vs
+// 3561, 384 4840 vs 3740, 1024 11338 vs 4474 -> DPAS from M=256 (it decodes each active expert once per 32-row block)
+static int g_prefill_min_m = 256;   // M >= this: DPAS prefill path
 void moe_set_prefill_min_m(int64_t v) { g_prefill_min_m = (int)v; }
 constexpr int kPrefillMB = 32;
 
