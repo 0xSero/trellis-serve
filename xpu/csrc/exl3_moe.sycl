@@ -1,0 +1,457 @@
+// Grouped EXL3 (trellis, mul1) MoE for Intel Xe2 (Arc Pro B70), expert weights addressed through a POINTER TABLE.
+//
+// Expert blob (one contiguous allocation per expert, 64-byte aligned; H = hidden, I = intermediate, W = 8K words/tile):
+//   [0]                 gate|up trellis  uint32 [H/16][2I/16][W]   (per k-row: I/16 gate tiles, then I/16 up tiles)
+//   [+GU]               down trellis     uint32 [I/16][H/16][W]
+//   then fp16 vectors   suh_g[H] suh_u[H] svh_g[I] svh_u[I] suh_d[I] svh_d[H]
+// For Qwen3.8-Flash-Next (H=2560, I=640, K=3) a blob is 1,862,400 B.
+// ptrs[e] (int64) is the blob address of expert e: a device slot (cache arena), or USM host memory
+// (sycl::malloc_host / pinned torch tensor) which the kernels read zero-copy over PCIe. Nothing else changes.
+//
+// Per MoE layer:
+//   align    : one work-group; histogram of topk ids -> active-expert list, pairs sorted by expert, inverse map
+//   gateup   : WG per (active expert, 128-col block): gate & up trellis GEMV (split-K in the WG), SLM reduce,
+//              output Hadamards, SiLU(g)*u, down input Hadamard -> abuf[pair, I] (fp16, Hadamard domain)
+//   down     : WG per (active expert, 128-col block of H): trellis GEMV, SLM reduce, output Hadamard * svh * w
+//              -> y[pair, H] fp32
+//   combine  : out[m] = sum_k y[pair_of[m, k]]  (fixed order: deterministic)
+// Prefill (many rows per expert): same pipeline with DPAS (XMX) GEMMs over MB-row blocks (moe_*_dpas below).
+
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include "exl3_esimd.h"
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+using namespace exl3;
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+namespace moe {
+
+static sycl::queue& queue_of(const at::Tensor& t) {
+    return c10::xpu::getCurrentXPUStream(t.device().index()).queue();
+}
+
+struct Geom {
+    int H, I, K;
+    int W() const { return 8 * K; }
+    size_t gu_bytes() const { return (size_t)(H / 16) * (2 * I / 16) * W() * 4; }
+    size_t d_bytes() const { return (size_t)(I / 16) * (H / 16) * W() * 4; }
+    size_t off_suh_g() const { return gu_bytes() + d_bytes(); }
+    size_t off_suh_u() const { return off_suh_g() + (size_t)H * 2; }
+    size_t off_svh_g() const { return off_suh_u() + (size_t)H * 2; }
+    size_t off_svh_u() const { return off_svh_g() + (size_t)I * 2; }
+    size_t off_suh_d() const { return off_svh_u() + (size_t)I * 2; }
+    size_t off_svh_d() const { return off_suh_d() + (size_t)I * 2; }
+    size_t blob() const { return off_svh_d() + (size_t)H * 2; }
+};
+
+struct Route {
+    const int* act_expert; const int* act_start; const int* act_cnt; const int* n_act;
+    const int* act_pstart;          // padded (to MB) row start per active expert (prefill)
+    const int* pair_tok; const float* pair_w;
+};
+
+// ------------------------------------------------------------------------------------------------
+// gate|up (+ SiLU + down input Hadamard). Threads: T = 4 * P  (proj x 2 strips of NT=4 tiles x P k-splits).
+template <int K, int MR, int P, typename TIn>
+struct GateUpKernel {
+    const TIn* x; int x_stride;
+    const int64_t* ptrs;
+    Route rt;
+    fp16* abuf;                     // [npairs, I]
+    int H, I;
+    size_t off_suh_g, off_svh_g, off_suh_d;
+
+    static constexpr int NT = 4;
+    static constexpr int W = Geo<K>::WORDS, D = Geo<K>::D;
+    using GK = GemvKernel<K, 2, MR, NT>;
+    static constexpr int ACC = GK::ACC, NP = GK::NP, GV = GK::GV, G = GK::G, TP = GK::TP;
+    static constexpr int L = 32 / Geo<K>::V;
+    static constexpr int SLM = P * MR * 256 * 4;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<SLM>();
+        int t = it.get_local_id(0);
+        int nbn = I / 128;
+        int wg = it.get_group(0);
+        int a = wg / nbn, nb = wg % nbn;
+        if (a >= rt.n_act[0]) return;
+        int e = rt.act_expert[a], s0 = rt.act_start[a], cnt = rt.act_cnt[a];
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
+        const uint32_t* tr = reinterpret_cast<const uint32_t*>(base);
+        int proj = t & 1, strip = (t >> 1) & 1, p = t >> 2;
+        int tiles_n = 2 * I / 16;
+        int tile_n0 = proj * (I / 16) + nb * 8 + strip * NT;
+        const fp16* suh = reinterpret_cast<const fp16*>(base + off_suh_g) + (size_t)proj * H;
+        int tk = H / 16, rps = tk / P, r0 = p * rps;
+
+        for (int c0 = 0; c0 < cnt; c0 += MR) {
+            int tok[MR];
+#pragma unroll
+            for (int m = 0; m < MR; ++m) tok[m] = (c0 + m < cnt) ? rt.pair_tok[s0 + c0 + m] : -1;
+            simd<float, ACC> acc = 0.0f;
+            for (int rb = r0; rb < r0 + rps; rb += 8) {
+                int kb = rb / 8;
+                simd<fp16, MR * 128> xblk;
+                simd<float, 128> su = convert<float>(block_load<fp16, 128>(suh + kb * 128));
+#pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    if (tok[m] >= 0) {
+                        simd<float, 128> v = convert<float>(block_load<TIn, 128>(x + (size_t)tok[m] * x_stride + kb * 128)) * su;
+                        v = convert<float>(convert<fp16>(v));
+                        fwht128(v);
+                        xblk.template select<128, 1>(m * 128) = convert<fp16>(v * kRsqrt128);
+                    } else {
+                        xblk.template select<128, 1>(m * 128) = 0;
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    size_t t0 = (size_t)(rb + i) * tiles_n + tile_n0;
+                    simd<uint32_t, NT * W> words, prev;
+                    load_words<NT, W>(tr + t0 * W, true, words, prev);
+                    if constexpr (GK::PLANAR) { planarize<NP, D, GV>(words); planarize<NP, D, GV>(prev); }
+                    simd<fp16, MR * 16> xr;
+#pragma unroll
+                    for (int m = 0; m < MR; ++m) xr.template select<16, 1>(m * 16) = xblk.template select<16, 1>(m * 128 + i * 16);
+                    simd<fp16, ACC> hacc = 0;
+                    GK::template step<0>(words, prev, xr, hacc, nullptr);
+                    acc += convert<float>(hacc);
+                }
+            }
+            // lanes -> columns; SLM part[p][m][proj*128 + strip*64 + j*16 + c]
+#pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                simd<float, NT * 16> o;
+#pragma unroll
+                for (int j = 0; j < NT; ++j)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        int b = ((m * NP + j / TP) * 2 + h) * GV + (j % TP) * G;
+                        simd<float, 8> s = acc.template select<8, L>(b);
+#pragma unroll
+                        for (int l = 1; l < L; ++l) s += acc.template select<8, L>(b + l);
+                        o.template select<8, 1>(j * 16 + h * 8) = s;
+                    }
+                slm_block_store<float, NT * 16>(((p * MR + m) * 256 + proj * 128 + strip * 64) * 4, o);
+            }
+            barrier();
+            if (t < MR && tok[t] >= 0) {
+                int m = t;
+                simd<float, 128> g = 0.0f, u = 0.0f;
+                for (int pp = 0; pp < P; ++pp) {
+                    g += slm_block_load<float, 128>(((pp * MR + m) * 256) * 4);
+                    u += slm_block_load<float, 128>(((pp * MR + m) * 256 + 128) * 4);
+                }
+                fwht128(g); fwht128(u);
+                const fp16* svg = reinterpret_cast<const fp16*>(base + off_svh_g);
+                g = convert<float>(convert<fp16>(g * kRsqrt128 * convert<float>(block_load<fp16, 128>(svg + nb * 128))));
+                u = convert<float>(convert<fp16>(u * kRsqrt128 * convert<float>(block_load<fp16, 128>(svg + I + nb * 128))));
+                simd<float, 128> act = g / (1.0f + exp(-g)) * u;           // SiLU(g) * u
+                act = convert<float>(convert<fp16>(act));
+                const fp16* sud = reinterpret_cast<const fp16*>(base + off_suh_d);
+                act = convert<float>(convert<fp16>(act * convert<float>(block_load<fp16, 128>(sud + nb * 128))));
+                fwht128(act);
+                block_store<fp16, 128>(abuf + (size_t)(s0 + c0 + m) * I + nb * 128, convert<fp16>(act * kRsqrt128));
+            }
+            barrier();
+        }
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
+// down: T = 2 * P (2 strips of NT=4 tiles x P k-splits); WG per (active expert, 128-col block of H).
+template <int K, int MR, int P>
+struct DownKernel {
+    const fp16* abuf;
+    const int64_t* ptrs;
+    Route rt;
+    float* y;                       // [npairs, H]
+    int H, I;
+    size_t off_d, off_svh_d;
+
+    static constexpr int NT = 4;
+    static constexpr int W = Geo<K>::WORDS, D = Geo<K>::D;
+    using GK = GemvKernel<K, 2, MR, NT>;
+    static constexpr int ACC = GK::ACC, NP = GK::NP, GV = GK::GV, G = GK::G, TP = GK::TP;
+    static constexpr int L = 32 / Geo<K>::V;
+    static constexpr int SLM = P * MR * 128 * 4;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<SLM>();
+        int t = it.get_local_id(0);
+        int nbn = H / 128;
+        int wg = it.get_group(0);
+        int a = wg / nbn, nb = wg % nbn;
+        if (a >= rt.n_act[0]) return;
+        int e = rt.act_expert[a], s0 = rt.act_start[a], cnt = rt.act_cnt[a];
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
+        const uint32_t* tr = reinterpret_cast<const uint32_t*>(base + off_d);
+        int strip = t & 1, p = t >> 1;
+        int tiles_n = H / 16;
+        int tile_n0 = nb * 8 + strip * NT;
+        int tk = I / 16, rps = tk / P, r0 = p * rps;
+
+        for (int c0 = 0; c0 < cnt; c0 += MR) {
+            bool valid[MR];
+#pragma unroll
+            for (int m = 0; m < MR; ++m) valid[m] = c0 + m < cnt;
+            simd<float, ACC> acc = 0.0f;
+            for (int r = r0; r < r0 + rps; ++r) {
+                size_t t0 = (size_t)r * tiles_n + tile_n0;
+                simd<uint32_t, NT * W> words, prev;
+                load_words<NT, W>(tr + t0 * W, true, words, prev);
+                if constexpr (GK::PLANAR) { planarize<NP, D, GV>(words); planarize<NP, D, GV>(prev); }
+                simd<fp16, MR * 16> xr = 0;
+#pragma unroll
+                for (int m = 0; m < MR; ++m)
+                    if (valid[m]) xr.template select<16, 1>(m * 16) = block_load<fp16, 16>(abuf + (size_t)(s0 + c0 + m) * I + r * 16);
+                simd<fp16, ACC> hacc = 0;
+                GK::template step<0>(words, prev, xr, hacc, nullptr);
+                acc += convert<float>(hacc);
+            }
+#pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                simd<float, NT * 16> o;
+#pragma unroll
+                for (int j = 0; j < NT; ++j)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        int b = ((m * NP + j / TP) * 2 + h) * GV + (j % TP) * G;
+                        simd<float, 8> s = acc.template select<8, L>(b);
+#pragma unroll
+                        for (int l = 1; l < L; ++l) s += acc.template select<8, L>(b + l);
+                        o.template select<8, 1>(j * 16 + h * 8) = s;
+                    }
+                slm_block_store<float, NT * 16>(((p * MR + m) * 128 + strip * 64) * 4, o);
+            }
+            barrier();
+            if (t < MR && valid[t]) {
+                int m = t;
+                simd<float, 128> v = 0.0f;
+                for (int pp = 0; pp < P; ++pp) v += slm_block_load<float, 128>(((pp * MR + m) * 128) * 4);
+                fwht128(v);
+                const fp16* svd = reinterpret_cast<const fp16*>(base + off_svh_d);
+                float w = rt.pair_w[s0 + c0 + m];
+                block_store<float, 128>(y + (size_t)(s0 + c0 + m) * H + nb * 128,
+                                        v * (kRsqrt128 * w) * convert<float>(block_load<fp16, 128>(svd + nb * 128)));
+            }
+            barrier();
+        }
+    }
+};
+
+// out[m, nb*128 : +128] = sum_k y[pair_of[m*topk + k], ...]
+template <typename TOut>
+struct CombineKernel {
+    const float* y; const int* pair_of; TOut* out;
+    int M, H, topk, out_stride;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        int id = it.get_global_id(0);
+        int nbn = H / 128;
+        int m = id / nbn, nb = id % nbn;
+        if (m >= M) return;
+        simd<float, 128> v = 0.0f;
+        for (int k = 0; k < topk; ++k) v += block_load<float, 128>(y + (size_t)pair_of[m * topk + k] * H + nb * 128);
+        block_store<TOut, 128>(out + (size_t)m * out_stride + nb * 128, convert<TOut>(v));
+    }
+};
+
+// ------------------------------------------------------------------------------------------------
+// Routing: one work-group of 1024 work-items (any number of pairs; loops with stride 1024).
+static void launch_align(sycl::queue& q, const int* ids, const float* w, int npairs, int topk, int E, int pad,
+                         int* act_expert, int* act_start, int* act_cnt, int* n_act, int* act_pstart,
+                         int* pair_tok, float* pair_w, int* pair_of) {
+    constexpr int WG = 1024;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int, 1> cnt(sycl::range<1>(E), h), start(sycl::range<1>(E), h), fill(sycl::range<1>(E), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            int l = it.get_local_id(0);
+            auto g = it.get_group();
+            for (int e = l; e < E; e += WG) { cnt[e] = 0; fill[e] = 0; }
+            sycl::group_barrier(g);
+            for (int i = l; i < npairs; i += WG) {
+                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                 sycl::access::address_space::local_space>(cnt[ids[i]]).fetch_add(1);
+            }
+            sycl::group_barrier(g);
+            // E <= WG: one expert per work-item
+            int c = l < E ? cnt[l] : 0;
+            int st = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());
+            int act = c > 0 ? 1 : 0;
+            int ai = sycl::exclusive_scan_over_group(g, act, sycl::plus<int>());
+            int nact = sycl::reduce_over_group(g, act, sycl::plus<int>());
+            int pc = (c + pad - 1) / pad * pad;
+            int pst = sycl::exclusive_scan_over_group(g, pc, sycl::plus<int>());
+            if (l < E) {
+                start[l] = st;
+                if (act) { act_expert[ai] = l; act_start[ai] = st; act_cnt[ai] = c; act_pstart[ai] = pst; }
+            }
+            if (l == 0) n_act[0] = nact;
+            sycl::group_barrier(g);
+            for (int i = l; i < npairs; i += WG) {
+                int e = ids[i];
+                int pos = start[e] + sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                                      sycl::access::address_space::local_space>(fill[e]).fetch_add(1);
+                pair_tok[pos] = i / topk; pair_w[pos] = w[i]; pair_of[i] = pos;
+            }
+        });
+    });
+}
+
+static int g_gu_p = 10, g_dn_p = 5;
+void moe_set_splits(int64_t gu_p, int64_t dn_p) { g_gu_p = (int)gu_p; g_dn_p = (int)dn_p; }
+
+template <int K, int MR, int P, typename TIn>
+static void launch_gateup(sycl::queue& q, const TIn* x, int x_stride, const int64_t* ptrs, Route rt, fp16* abuf,
+                          int H, int I, const Geom& gm, int max_act) {
+    GateUpKernel<K, MR, P, TIn> k{x, x_stride, ptrs, rt, abuf, H, I, gm.off_suh_g(), gm.off_svh_g(), gm.off_suh_d()};
+    int T = 4 * P;
+    size_t n = (size_t)max_act * (I / 128) * T;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), k); });
+}
+
+template <int K, int MR, int P>
+static void launch_down(sycl::queue& q, const fp16* abuf, const int64_t* ptrs, Route rt, float* y, int H, int I,
+                        const Geom& gm, int max_act) {
+    DownKernel<K, MR, P> k{abuf, ptrs, rt, y, H, I, gm.gu_bytes(), gm.off_svh_d()};
+    int T = 2 * P;
+    size_t n = (size_t)max_act * (H / 128) * T;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, T), k); });
+}
+
+template <int K, typename TIn>
+static void gateup_dispatch(int MR, sycl::queue& q, const TIn* x, int xs, const int64_t* ptrs, Route rt, fp16* abuf,
+                            int H, int I, const Geom& gm, int max_act) {
+#define GU(MRV, PV) if (MR == MRV && g_gu_p == PV) return launch_gateup<K, MRV, PV, TIn>(q, x, xs, ptrs, rt, abuf, H, I, gm, max_act);
+    GU(1, 10) GU(2, 10) GU(4, 10) GU(8, 5)
+    GU(1, 5) GU(2, 5) GU(4, 5) GU(1, 20) GU(2, 20)
+#undef GU
+    TORCH_CHECK(false, "moe gateup: unsupported MR/P ", MR, "/", g_gu_p);
+}
+
+template <int K>
+static void down_dispatch(int MR, sycl::queue& q, const fp16* abuf, const int64_t* ptrs, Route rt, float* y, int H,
+                          int I, const Geom& gm, int max_act) {
+#define DN(MRV, PV) if (MR == MRV && g_dn_p == PV) return launch_down<K, MRV, PV>(q, abuf, ptrs, rt, y, H, I, gm, max_act);
+    DN(1, 5) DN(2, 5) DN(4, 5) DN(8, 5)
+    DN(1, 10) DN(2, 10) DN(4, 10) DN(1, 20) DN(2, 20) DN(1, 40)
+#undef DN
+    TORCH_CHECK(false, "moe down: unsupported MR/P ", MR, "/", g_dn_p);
+}
+
+static int g_mr_override = 0;
+void moe_set_mr(int64_t mr) { g_mr_override = (int)mr; }
+
+// Routing tensors bundled as one int32 buffer so a caller can keep it across layers / replay it.
+struct RouteBufs {
+    at::Tensor ib;   // int32
+    at::Tensor fb;   // float
+    Route rt; int* act_expert; int* act_start; int* act_cnt; int* n_act; int* act_pstart; int* pair_tok; int* pair_of;
+    float* pair_w;
+};
+
+static RouteBufs make_route(const at::Tensor& like, int npairs, int E) {
+    RouteBufs r;
+    int A = std::min(npairs, E);
+    r.ib = at::empty({4 * A + 1 + 2 * npairs + 16}, like.options().dtype(at::kInt));
+    r.fb = at::empty({npairs}, like.options().dtype(at::kFloat));
+    int* p = r.ib.data_ptr<int>();
+    r.act_expert = p; r.act_start = p + A; r.act_cnt = p + 2 * A; r.act_pstart = p + 3 * A; r.n_act = p + 4 * A;
+    r.pair_tok = p + 4 * A + 1; r.pair_of = r.pair_tok + npairs;
+    r.pair_w = r.fb.data_ptr<float>();
+    r.rt = Route{r.act_expert, r.act_start, r.act_cnt, r.n_act, r.act_pstart, r.pair_tok, r.pair_w};
+    return r;
+}
+
+// Full routed-MoE forward (decode path: GEMV kernels).
+at::Tensor moe_forward(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, at::Tensor ptrs, int64_t I, int64_t K,
+                       int64_t n_experts) {
+    TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1);
+    TORCH_CHECK(topk_ids.scalar_type() == at::kInt && topk_ids.is_contiguous());
+    TORCH_CHECK(topk_w.scalar_type() == at::kFloat && topk_w.is_contiguous());
+    TORCH_CHECK(ptrs.scalar_type() == at::kLong && ptrs.is_contiguous());
+    int M = x.size(0), H = x.size(1), topk = topk_ids.size(1), E = (int)n_experts;
+    TORCH_CHECK(E <= 1024 && H % 128 == 0 && I % 128 == 0);
+    auto out = at::empty_like(x);
+    if (M == 0) return out;
+    auto& q = queue_of(x);
+    Geom gm{H, (int)I, (int)K};
+    int npairs = M * topk;
+    auto rb = make_route(x, npairs, E);
+    launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, 1, rb.act_expert,
+                 rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of);
+    int max_act = std::min(npairs, E);
+    auto abuf = at::empty({npairs, I}, x.options().dtype(at::kHalf));
+    auto y = at::empty({npairs, H}, x.options().dtype(at::kFloat));
+    // rows per expert chunk: 1 at M=1, else up to 4 (8 for bigger batches)
+    int MR = g_mr_override ? g_mr_override : (M <= 1 ? 1 : (M <= 4 ? 2 : (M <= 32 ? 4 : 8)));
+    const int64_t* pp = ptrs.data_ptr<int64_t>();
+    fp16* ab = reinterpret_cast<fp16*>(abuf.data_ptr());
+    TORCH_CHECK(K == 3, "moe: K=3 only in this build");
+    if (x.scalar_type() == at::kHalf)
+        gateup_dispatch<3, fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+    else if (x.scalar_type() == at::kBFloat16)
+        gateup_dispatch<3, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+    else TORCH_CHECK(false, "x dtype");
+    down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
+    int n = M * (H / 128), local = 8;
+    auto run_c = [&](auto tag) {
+        using TO = decltype(tag);
+        CombineKernel<TO> ck{y.data_ptr<float>(), rb.pair_of, reinterpret_cast<TO*>(out.data_ptr()), M, H, topk, (int)out.stride(0)};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((n + local - 1) / local * local, local), ck); });
+    };
+    if (x.scalar_type() == at::kHalf) run_c(fp16{}); else run_c(bf16{});
+    return out;
+}
+
+// Debug: routing tables as tensors.
+std::vector<at::Tensor> moe_align(at::Tensor topk_ids, at::Tensor topk_w, int64_t n_experts, int64_t pad) {
+    int M = topk_ids.size(0), topk = topk_ids.size(1), E = (int)n_experts, npairs = M * topk;
+    auto rb = make_route(topk_ids, npairs, E);
+    launch_align(queue_of(topk_ids), topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, (int)pad,
+                 rb.act_expert, rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of);
+    return {rb.ib, rb.fb};
+}
+
+// ------------------------------------------------------------------------------------------------
+// Host USM: sycl::malloc_host in torch's XPU context, returned as a CPU uint8 tensor (device-readable, zero-copy).
+at::Tensor host_alloc(int64_t nbytes) {
+    auto& q = c10::xpu::getCurrentXPUStream().queue();
+    void* p = sycl::malloc_host((size_t)nbytes, q);
+    TORCH_CHECK(p, "sycl::malloc_host failed for ", nbytes, " bytes");
+    sycl::context ctx = q.get_context();
+    return at::from_blob(p, {nbytes}, [ctx](void* ptr) { sycl::free(ptr, ctx); },
+                         at::TensorOptions().dtype(at::kByte).device(at::kCPU));
+}
+
+// 0 unknown (pageable), 1 host USM, 2 device USM, 3 shared USM
+int64_t usm_kind(int64_t ptr) {
+    auto& q = c10::xpu::getCurrentXPUStream().queue();
+    auto k = sycl::get_pointer_type(reinterpret_cast<void*>(ptr), q.get_context());
+    return k == sycl::usm::alloc::host ? 1 : k == sycl::usm::alloc::device ? 2 : k == sycl::usm::alloc::shared ? 3 : 0;
+}
+
+// Async copy of raw bytes on the CURRENT XPU stream (use torch.xpu.stream(s) to pick a second queue).
+void memcpy_async(int64_t dst, int64_t src, int64_t nbytes) {
+    auto& q = c10::xpu::getCurrentXPUStream().queue();
+    q.memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), (size_t)nbytes);
+}
+
+int64_t blob_bytes(int64_t H, int64_t I, int64_t K) { return (int64_t)Geom{(int)H, (int)I, (int)K}.blob(); }
+
+}  // namespace moe
+
+TORCH_LIBRARY(exl3xpu_moe, m) {
+    m.def("moe_forward(Tensor x, Tensor topk_ids, Tensor topk_w, Tensor ptrs, int I, int K, int n_experts) -> Tensor");
+    m.impl("moe_forward", torch::kXPU, &moe::moe_forward);
+    m.def("moe_align(Tensor topk_ids, Tensor topk_w, int n_experts, int pad) -> Tensor[]");
+    m.impl("moe_align", torch::kXPU, &moe::moe_align);
+    m.def("host_alloc(int nbytes) -> Tensor", &moe::host_alloc);
+    m.def("usm_kind(int ptr) -> int", &moe::usm_kind);
+    m.def("memcpy_async(int dst, int src, int nbytes) -> ()", &moe::memcpy_async);
+    m.def("blob_bytes(int H, int I, int K) -> int", &moe::blob_bytes);
+    m.def("moe_set_splits(int gu_p, int dn_p) -> ()", &moe::moe_set_splits);
+    m.def("moe_set_mr(int mr) -> ()", &moe::moe_set_mr);
+}
