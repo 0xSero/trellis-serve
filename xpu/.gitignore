@@ -1,0 +1,7 @@
+__pycache__/
+*.so
+build/
+logs/
+*.egg-info/
+.claude/
+bench/corpus/

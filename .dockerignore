@@ -1,0 +1,7 @@
+.git
+**/__pycache__
+**/*.so
+**/build
+**/logs
+xpu/docs
+xpu/bench/results

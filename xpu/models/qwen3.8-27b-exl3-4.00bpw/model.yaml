@@ -1,0 +1,53 @@
+# Serving config for one model. Everything model-specific lives here; the engine core
+# (exl3xpu/, csrc/) knows nothing about Qwen. Consumed by scripts/serve.py.
+
+id: qwen3.8-27b-exl3-4.00bpw
+served_model_name: qwen3.8-27b-exl3
+
+source:
+  repo: turboderp/Qwen3.8-27B-exl3
+  revision: 113cf7ab958054860e43fb7f3063b1af19171095   # branch 4.00bpw
+  quant: exl3 1.4.2, 4.00 bpw (lm_head 6 bpw), codebook mul1
+  notes: >
+    Hybrid Qwen3.5-architecture dense model: 64 layers (48 Gated DeltaNet + 16 gated full attention),
+    hidden 5120. EXL3: all main linears (4 bpw), lm_head (6 bpw), MTP head incl. mtp.fc (4 bpw; not listed in
+    quantization_config.json's tensor_storage, detected from the weight index). bf16: norms, in_proj_a/b,
+    embeddings, the 27-block vision tower.
+
+# One B70: MTP (the EXL3 repo ships the MTP head quantized to EXL3 4-bit), vision (bf16 tower in the repo),
+# 256K context with fp8 KV. Weights 14.9 GiB + MTP head + vision; KV fp8 256K ~8.4 GiB.
+vllm:
+  dtype: float16
+  max_model_len: 262144
+  kv_cache_dtype: fp8
+  gpu_memory_utilization: 0.965
+  max_num_seqs: 16
+  max_num_batched_tokens: 4096   # prefill chunk: decode waits ~3.7 s behind a long prompt (8192: ~7 s); keeps 128K prefill >= 1000
+  trust_remote_code: true
+  enable_prefix_caching: true   # must be explicit: vLLM 0.26 leaves it off for hybrid (GDN) models
+  mamba_cache_mode: align
+  speculative_config:
+    method: qwen3_5_mtp
+    num_speculative_tokens: 3
+  limit_mm_per_prompt: {image: 32, video: 4}
+  # cap image area at preprocessing (the processor default allows 16.7 MP, whose ~65K ViT patches crash the
+  # vision encoder with UR OUT_OF_RESOURCES); larger images are downscaled to <= 4.2 MP (~4K tokens)
+  mm_processor_kwargs: {size: {longest_edge: 4194304, shortest_edge: 65536}}
+  compilation_config:
+    cudagraph_mode: FULL_DECODE_ONLY
+    cudagraph_capture_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64]
+
+env:
+  VLLM_XPU_ENABLE_XPU_GRAPH: "1"
+  EXL3_DRAFT_VOCAB: "{model_dir}/draft_vocab.json"   # pruned MTP draft head (scripts/draft_vocab.py)
+  EXL3_KV_BLOCK_EXACT: "1"   # keep 1600-token KV blocks (not 2048): C16 thinking 10 -> 14 streams, +17% agg
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  EXL3_ONEDNN_ATTN: "1"    # oneDNN Graph fused SDPA for long-prefix prefill: 128K 1234 -> 1415, 254K 769 -> 911 tok/s; needle 6/6 at 131K/240K
+  EXL3_INT8_PREFILL: "1"   # W8A8 prefill linears: 32K 1434 -> 1979 tok/s, omp replay TTFT p50 4.65 -> 3.78 s; NLL +0.17%
+
+# Data parallel: one replica per GPU behind scripts/lb.py (the model fits one 32 GB B70).
+parallel:
+  mode: data
+  gpus: [0, 1]
+  base_port: 8100
+  lb_port: 8000

@@ -1,0 +1,16 @@
+[project]
+name = "sglang-exl3"
+version = "0.1.0"
+description = "EXL3 (ExLlamaV3 trellis quantization) inside stock SGLang; Ampere sm_86 first"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.entry-points."sglang.srt.plugins"]
+exl3 = "sglang_exl3.plugin:activate"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
