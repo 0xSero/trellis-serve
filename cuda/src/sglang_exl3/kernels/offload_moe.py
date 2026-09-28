@@ -235,6 +235,44 @@ class ExpertCache:
             self.commit(layer, topk_ids)
         return y
 
+    def set_layer_bank(self, layer: int, host_base: int) -> None:
+        """(Re)point layer `layer` at its host bank (e.g. as layers finish loading). The layer must have no resident
+        experts yet (fresh cache)."""
+        e = torch.arange(self.E, dtype=torch.int64, device=self.tables.device)
+        self.host_bases[layer] = host_base
+        self.tables[layer].copy_(host_base + (e * self.lay.record_bytes).unsqueeze(1) + self.offs.unsqueeze(0))
+
+    def preload(self, layer: int, experts) -> None:
+        """Init-time warm fill (not graph-safe, host-side slot choice): copy `experts` of `layer` into free slots."""
+        free = (self.owner < 0).nonzero().flatten()
+        ex = torch.as_tensor(list(experts), dtype=torch.int64, device=self.tables.device)
+        if ex.numel() > free.numel():
+            raise ValueError("not enough free slots")
+        sl = free[: ex.numel()].to(torch.int64)
+        rec = self.lay.record_bytes
+        _mod().copy_records(self.host_bases[layer] + ex * rec, self.arena.data_ptr() + sl * rec, rec)
+        g = layer * self.E + ex
+        self.slot_of[g] = sl.to(torch.int32)
+        self.owner[sl] = g.to(torch.int32)
+        rows = self.tables[layer].clone()
+        rows[ex] = self.arena.data_ptr() + (sl * rec).unsqueeze(1) + self.offs.unsqueeze(0)
+        self.tables[layer].copy_(rows)
+
+    def prefill_plan(self, layer: int, staging_base: int, table_out: torch.Tensor, src_out: torch.Tensor,
+                     dst_out: torch.Tensor) -> None:
+        """Prefill of `layer` from a staging buffer (record layout, row e = expert e): table_out [E, 6] points resident
+        experts at their slots and the others at staging row e; src_out / dst_out int64 [E] = the copy list for
+        copy_records / copy_records_persistent (src 0 = resident, skipped): only the missing experts cross PCIe.
+        Device ops only (graph-capturable)."""
+        rec = self.lay.record_bytes
+        e = torch.arange(self.E, dtype=torch.int64, device=self.tables.device)
+        sl = self.slot_of[layer * self.E:(layer + 1) * self.E].to(torch.int64)
+        stage = staging_base + e * rec
+        res = sl >= 0
+        fill_table_(table_out, torch.where(res, self.arena.data_ptr() + sl * rec, stage), self.offs)
+        src_out.copy_(torch.where(res, torch.zeros_like(stage), self.host_bases[layer] + e * rec))
+        dst_out.copy_(stage)
+
     def hit_rate(self) -> torch.Tensor:
         s = self.stats.double()
         return s[:, 0] / (s[:, 0] + s[:, 1]).clamp(min=1)
