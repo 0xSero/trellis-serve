@@ -340,9 +340,9 @@ struct DownKernel {
 };
 
 // out[m, nb*128 : +128] = sum_k y[pair_of[m*topk + k], ...]
-template <typename TOut>
+template <typename TOut, typename TY = float>
 struct CombineKernel {
-    const float* y; const int* pair_of; TOut* out;
+    const TY* y; const int* pair_of; TOut* out;
     int M, H, topk, out_stride;
     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
         int id = it.get_global_id(0);
@@ -350,8 +350,215 @@ struct CombineKernel {
         int m = id / nbn, nb = id % nbn;
         if (m >= M) return;
         simd<float, 128> v = 0.0f;
-        for (int k = 0; k < topk; ++k) v += block_load<float, 128>(y + (size_t)(pair_of ? pair_of[m * topk + k] : m * topk + k) * H + nb * 128);
+        for (int k = 0; k < topk; ++k)
+            v += convert<float>(block_load<TY, 128>(y + (size_t)(pair_of ? pair_of[m * topk + k] : m * topk + k) * H + nb * 128));
         block_store<TOut, 128>(out + (size_t)m * out_stride + nb * 128, convert<TOut>(v));
+    }
+};
+
+
+// ------------------------------------------------------------------------------------------------
+// PREFILL (DPAS / XMX). Rows of each active expert are split in MB-row blocks (align pads each expert to MB).
+// Trellis decode: SIMD32 across one PLANAR4 group of 4 tiles (the GEMV state function), scattered straight into
+// four VNNI B operands (K=3: P=1, MS=4 geometry of DpasKernel::build). A operands: MB x 16 fp16 per tile-row.
+
+template <int K, int NT, int u>
+ESIMD_INLINE void build4(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_t, NT * Geo<K>::WORDS>& prev,
+                         simd<fp16, 256 * NT>& B) {
+    if constexpr (u < Geo<K>::V) {
+        static_assert(Geo<K>::V == 32 && NT * Geo<K>::G == 32, "build4: K with 32 values per period, 4-tile groups");
+        simd<fp16, 32> v = decode_cb_h<2, 32>(tile_states<K, u, NT, true>(words, prev));
+        constexpr int h = (u >> 2) & 1;
+        constexpr int R = 4 * ((u >> 1) & 1) + ((u >> 3) & 3);
+        constexpr int C0 = 16 * h + (u & 1);
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            auto Bm = B.template select<256, 1>(256 * j).template bit_cast_view<fp16, 8, 32>();
+            Bm.template select<1, 1, 8, 2>(R, C0) = v.template select<8, 1>(8 * j);
+        }
+        build4<K, NT, u + 1>(words, prev, B);
+    }
+}
+
+// gate|up: WG per row block b; T = 2 * (I/16) / NT threads (I=640: 20), thread = (proj, 4-tile group).
+template <int K, int MB, typename TIn>
+struct GateUpDpasKernel {
+    const TIn* x; int x_stride;
+    const int64_t* ptrs;
+    Route rt;
+    const int* blk_a; const int* n_blk;
+    fp16* ablk;                     // [blocks][I/16][MB][16] (down A operand, Hadamard domain)
+    int H, I;
+    size_t off_suh_g, off_svh_g, off_suh_d;
+
+    static constexpr int NT = 4, W = Geo<K>::WORDS;
+    static constexpr int SLM_A = 2 * 2 * 8 * MB * 16 * 2;          // [buf][proj][8 tile-rows][MB][16] fp16
+    static constexpr int SLM_E = MB * 256 * 4;                       // [MB][g 128 | u 128] fp32
+    static ESIMD_INLINE int a_off(int buf, int pj, int i, int m) { return (((buf * 2 + pj) * 8 + i) * MB + m) * 16 * 2; }
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<SLM_A + SLM_E>();
+        int t = it.get_local_id(0), T = it.get_local_range(0);
+        int b = it.get_group(0);
+        if (b >= n_blk[0]) return;
+        int a = blk_a[b];
+        int e, s0, cnt;
+        rt.get(a, e, s0, cnt);
+        int r0 = (b - rt.act_pstart[a] / MB) * MB;
+        int rows = cnt - r0; if (rows > MB) rows = MB;
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
+        const uint32_t* tr = reinterpret_cast<const uint32_t*>(base);
+        const fp16* suh = reinterpret_cast<const fp16*>(base + off_suh_g);
+        int half = T / 2;
+        int proj = t / half, grp = t % half;
+        int tiles_n = 2 * I / 16;
+        int tile_n0 = proj * (I / 16) + grp * NT;
+
+        simd<float, NT * MB * 16> acc = 0.0f;      // [NT][MB][16]
+        int nkb = H / 128;
+        for (int kb = 0; kb < nkb; ++kb) {
+            int buf = kb & 1;
+            for (int w = t; w < 2 * MB; w += T) {
+                int pj = w / MB, m = w % MB;
+                simd<fp16, 128> vh = 0;
+                if (m < rows) {
+                    int tok = rt.tok(s0 + r0 + m);
+                    simd<float, 128> v = convert<float>(block_load<TIn, 128>(x + (size_t)tok * x_stride + kb * 128)) *
+                                         convert<float>(block_load<fp16, 128>(suh + (size_t)pj * H + kb * 128));
+                    v = convert<float>(convert<fp16>(v));
+                    fwht128(v);
+                    vh = convert<fp16>(v * kRsqrt128);
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) slm_block_store<fp16, 16>(a_off(buf, pj, i, m), vh.template select<16, 1>(i * 16));
+            }
+            barrier();
+#pragma unroll 1
+            for (int i = 0; i < 8; ++i) {
+                int r = kb * 8 + i;
+                simd<uint32_t, NT * W> words, prev;
+                load_planar<K, NT>(tr + ((size_t)r * tiles_n + tile_n0) * W, words, prev);
+                simd<fp16, 256 * NT> B;
+                build4<K, NT, 0>(words, prev, B);
+#pragma unroll
+                for (int rb = 0; rb < MB / 8; ++rb) {
+                    simd<fp16, 128> A = slm_block_load<fp16, 128>(a_off(buf, proj, i, rb * 8));
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) {
+                        auto c = acc.template select<128, 1>((j * MB + rb * 8) * 16);
+                        c = xmx::dpas<8, 8, float, float, fp16, fp16>(simd<float, 128>(c), simd<fp16, 256>(B.template select<256, 1>(256 * j)), A);
+                    }
+                }
+            }
+        }
+        // epilogue, one 128-col block of g and u at a time (2 groups of 4 tiles per proj)
+        const fp16* svg = reinterpret_cast<const fp16*>(base + off_svh_g);
+        const fp16* sud = reinterpret_cast<const fp16*>(base + off_suh_d);
+        int tk_d = I / 16;
+        for (int nb = 0; nb < I / 128; ++nb) {
+            barrier();
+            if (grp / 2 == nb) {
+                int hf = grp % 2;
+#pragma unroll
+                for (int m = 0; m < MB; ++m) {
+                    simd<float, NT * 16> o;
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) o.template select<16, 1>(j * 16) = acc.template select<16, 1>((j * MB + m) * 16);
+                    slm_block_store<float, NT * 16>(SLM_A + (m * 256 + proj * 128 + hf * 64) * 4, o);
+                }
+            }
+            barrier();
+            for (int m = t; m < rows; m += T) {
+                simd<float, 128> g = slm_block_load<float, 128>(SLM_A + (m * 256) * 4);
+                simd<float, 128> u = slm_block_load<float, 128>(SLM_A + (m * 256 + 128) * 4);
+                fwht128(g); fwht128(u);
+                g = convert<float>(convert<fp16>(g * kRsqrt128 * convert<float>(block_load<fp16, 128>(svg + nb * 128))));
+                u = convert<float>(convert<fp16>(u * kRsqrt128 * convert<float>(block_load<fp16, 128>(svg + I + nb * 128))));
+                simd<float, 128> act = g / (1.0f + exp(-g)) * u;
+                act = convert<float>(convert<fp16>(act));
+                act = convert<float>(convert<fp16>(act * convert<float>(block_load<fp16, 128>(sud + nb * 128))));
+                fwht128(act);
+                simd<fp16, 128> ah = convert<fp16>(act * kRsqrt128);
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    block_store<fp16, 16>(ablk + (((size_t)b * tk_d + nb * 8 + i) * MB + m) * 16, ah.template select<16, 1>(i * 16));
+            }
+        }
+    }
+};
+
+// down: WG per (row block b, quarter q of H); T = (H/4/16)/NT threads (H=2560: 10).
+template <int K, int MB, typename TY>
+struct DownDpasKernel {
+    const fp16* ablk;
+    const int64_t* ptrs;
+    Route rt;
+    const int* blk_a; const int* n_blk;
+    TY* y;                          // [npairs, H] (sorted pair order), routing weight applied
+    int H, I;
+    size_t off_d, off_svh_d;
+
+    static constexpr int NT = 4, W = Geo<K>::WORDS;
+    static constexpr int NQ = 4;
+    static constexpr int SLM_E = MB * 128 * 4;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<SLM_E>();
+        int t = it.get_local_id(0), T = it.get_local_range(0);
+        int wg = it.get_group(0);
+        int b = wg / NQ, qd = wg % NQ;
+        if (b >= n_blk[0]) return;
+        int a = blk_a[b];
+        int e, s0, cnt;
+        rt.get(a, e, s0, cnt);
+        int r0 = (b - rt.act_pstart[a] / MB) * MB;
+        int rows = cnt - r0; if (rows > MB) rows = MB;
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(ptrs[e]);
+        const uint32_t* tr = reinterpret_cast<const uint32_t*>(base + off_d);
+        int tiles_n = H / 16, tk = I / 16;
+        int qcols = H / NQ;
+        int tile_n0 = qd * (qcols / 16) + t * NT;
+
+        simd<float, NT * MB * 16> acc = 0.0f;
+#pragma unroll 1
+        for (int r = 0; r < tk; ++r) {
+            simd<uint32_t, NT * W> words, prev;
+            load_planar<K, NT>(tr + ((size_t)r * tiles_n + tile_n0) * W, words, prev);
+            simd<fp16, 256 * NT> B;
+            build4<K, NT, 0>(words, prev, B);
+#pragma unroll
+            for (int rb = 0; rb < MB / 8; ++rb) {
+                simd<fp16, 128> A = block_load<fp16, 128>(ablk + (((size_t)b * tk + r) * MB + rb * 8) * 16);
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    auto c = acc.template select<128, 1>((j * MB + rb * 8) * 16);
+                    c = xmx::dpas<8, 8, float, float, fp16, fp16>(simd<float, 128>(c), simd<fp16, 256>(B.template select<256, 1>(256 * j)), A);
+                }
+            }
+        }
+        const fp16* svd = reinterpret_cast<const fp16*>(base + off_svh_d);
+        for (int nbl = 0; nbl < qcols / 128; ++nbl) {
+            barrier();
+            if (t / 2 == nbl) {
+                int hf = t % 2;
+#pragma unroll
+                for (int m = 0; m < MB; ++m) {
+                    simd<float, NT * 16> o;
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) o.template select<16, 1>(j * 16) = acc.template select<16, 1>((j * MB + m) * 16);
+                    slm_block_store<float, NT * 16>((m * 128 + hf * 64) * 4, o);
+                }
+            }
+            barrier();
+            int nb = qd * (qcols / 128) + nbl;
+            for (int m = t; m < rows; m += T) {
+                simd<float, 128> v = slm_block_load<float, 128>(m * 128 * 4);
+                fwht128(v);
+                float w = rt.pair_w[s0 + r0 + m];
+                v = v * (kRsqrt128 * w) * convert<float>(block_load<fp16, 128>(svd + nb * 128));
+                block_store<TY, 128>(y + (size_t)(s0 + r0 + m) * H + nb * 128, convert<TY>(v));
+            }
+        }
     }
 };
 
@@ -359,7 +566,7 @@ struct CombineKernel {
 // Routing: one work-group of 1024 work-items (any number of pairs; loops with stride 1024).
 static void launch_align(sycl::queue& q, const int* ids, const float* w, int npairs, int topk, int E, int pad,
                          int* act_expert, int* act_start, int* act_cnt, int* n_act, int* act_pstart,
-                         int* pair_tok, float* pair_w, int* pair_of) {
+                         int* pair_tok, float* pair_w, int* pair_of, int* blk_a = nullptr, int* n_blk = nullptr) {
     constexpr int WG = 1024;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int, 1> cnt(sycl::range<1>(E), h), start(sycl::range<1>(E), h), fill(sycl::range<1>(E), h);
@@ -384,8 +591,11 @@ static void launch_align(sycl::queue& q, const int* ids, const float* w, int npa
             if (l < E) {
                 start[l] = st;
                 if (act) { act_expert[ai] = l; act_start[ai] = st; act_cnt[ai] = c; act_pstart[ai] = pst; }
+                if (act && blk_a)
+                    for (int j = 0; j < pc / pad; ++j) blk_a[pst / pad + j] = ai;
             }
-            if (l == 0) n_act[0] = nact;
+            int ptot = sycl::reduce_over_group(g, pc, sycl::plus<int>());
+            if (l == 0) { n_act[0] = nact; if (n_blk) n_blk[0] = ptot / pad; }
             sycl::group_barrier(g);
             for (int i = l; i < npairs; i += WG) {
                 int e = ids[i];
@@ -453,19 +663,64 @@ struct RouteBufs {
     at::Tensor fb;   // float
     Route rt; int* act_expert; int* act_start; int* act_cnt; int* n_act; int* act_pstart; int* pair_tok; int* pair_of;
     float* pair_w;
+    int* blk_a = nullptr; int* n_blk = nullptr; int max_blk = 0;
 };
 
-static RouteBufs make_route(const at::Tensor& like, int npairs, int E) {
+static RouteBufs make_route(const at::Tensor& like, int npairs, int E, int mb = 0) {
     RouteBufs r;
     int A = std::min(npairs, E);
-    r.ib = at::empty({4 * A + 1 + 2 * npairs + 16}, like.options().dtype(at::kInt));
+    int mxb = mb ? (npairs + mb - 1) / mb + A : 0;   // sum_e ceil(c_e / MB) <= npairs / MB + active experts
+    r.ib = at::empty({4 * A + 1 + 2 * npairs + 16 + mxb + 1}, like.options().dtype(at::kInt));
     r.fb = at::empty({npairs}, like.options().dtype(at::kFloat));
     int* p = r.ib.data_ptr<int>();
     r.act_expert = p; r.act_start = p + A; r.act_cnt = p + 2 * A; r.act_pstart = p + 3 * A; r.n_act = p + 4 * A;
     r.pair_tok = p + 4 * A + 1; r.pair_of = r.pair_tok + npairs;
     r.pair_w = r.fb.data_ptr<float>();
     r.rt = Route{r.act_expert, r.act_start, r.act_cnt, r.n_act, r.act_pstart, r.pair_tok, r.pair_w};
+    if (mb) { r.blk_a = r.pair_of + npairs + 16; r.n_blk = r.blk_a + mxb; r.max_blk = mxb; }
     return r;
+}
+
+static int g_prefill_min_m = 64;   // M >= this: DPAS prefill path
+void moe_set_prefill_min_m(int64_t v) { g_prefill_min_m = (int)v; }
+constexpr int kPrefillMB = 32;
+
+static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, const at::Tensor& topk_w,
+                              const at::Tensor& ptrs, const Geom& gm, int E, at::Tensor& out) {
+    auto& q = queue_of(x);
+    int M = x.size(0), H = gm.H, I = gm.I, topk = topk_ids.size(1), npairs = M * topk;
+    constexpr int MB = kPrefillMB;
+    TORCH_CHECK(gm.K == 3 && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0, "moe prefill geometry");
+    auto rb = make_route(x, npairs, E, MB);
+    launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, MB, rb.act_expert,
+                 rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of, rb.blk_a, rb.n_blk);
+    auto ablk = at::empty({(int64_t)rb.max_blk * (I / 16) * MB * 16}, x.options().dtype(at::kHalf));
+    auto y = at::empty({npairs, H}, x.options().dtype(at::kHalf));
+    const int64_t* pp = ptrs.data_ptr<int64_t>();
+    sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+    int T1 = 2 * (I / 16) / 4;
+    auto run_gu = [&](auto tag) {
+        using TIn = decltype(tag);
+        GateUpDpasKernel<3, MB, TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), (int)x.stride(0), pp, rb.rt, rb.blk_a,
+                                       rb.n_blk, reinterpret_cast<fp16*>(ablk.data_ptr()), H, I, gm.off_suh_g(),
+                                       gm.off_svh_g(), gm.off_suh_d()};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * T1, T1), props, k); });
+    };
+    if (!(g_debug_skip & 1)) { if (x.scalar_type() == at::kHalf) run_gu(fp16{}); else run_gu(bf16{}); }
+    int T2 = (H / 4 / 16) / 4;
+    DownDpasKernel<3, MB, fp16> kd{reinterpret_cast<const fp16*>(ablk.data_ptr()), pp, rb.rt, rb.blk_a, rb.n_blk,
+                                   reinterpret_cast<fp16*>(y.data_ptr()), H, I, gm.gu_bytes(), gm.off_svh_d()};
+    if (!(g_debug_skip & 2))
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * 4 * T2, T2), props, kd); });
+    int n = M * (H / 128), local = 8;
+    auto run_c = [&](auto tag) {
+        using TO = decltype(tag);
+        CombineKernel<TO, fp16> ck{reinterpret_cast<const fp16*>(y.data_ptr()), rb.pair_of, reinterpret_cast<TO*>(out.data_ptr()),
+                                   M, H, topk, (int)out.stride(0)};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((n + local - 1) / local * local, local), ck); });
+    };
+    if (!(g_debug_skip & 4)) { if (x.scalar_type() == at::kHalf) run_c(fp16{}); else run_c(bf16{}); }
+    return out;
 }
 
 // Full routed-MoE forward (decode path: GEMV kernels).
@@ -482,6 +737,7 @@ at::Tensor moe_forward(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, at:
     auto& q = queue_of(x);
     Geom gm{H, (int)I, (int)K};
     int npairs = M * topk;
+    if (M >= g_prefill_min_m) return moe_prefill(x, topk_ids, topk_w, ptrs, gm, E, out);
     bool pair_mode = M <= g_pair_max_m;
     auto rb = make_route(x, pair_mode ? 1 : npairs, E);
     if (pair_mode) {
@@ -565,4 +821,5 @@ TORCH_LIBRARY(exl3xpu_moe, m) {
     m.def("moe_set_mr(int mr) -> ()", &moe::moe_set_mr);
     m.def("moe_set_debug(int v) -> ()", &moe::moe_set_debug);
     m.def("moe_set_pair_max_m(int v) -> ()", &moe::moe_set_pair_max_m);
+    m.def("moe_set_prefill_min_m(int v) -> ()", &moe::moe_set_prefill_min_m);
 }

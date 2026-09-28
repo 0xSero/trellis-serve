@@ -22,6 +22,8 @@ ap.add_argument("--check", action="store_true")
 ap.add_argument("--check-m", default="1,2,3,4,8,16")
 ap.add_argument("--bench-decode", action="store_true")
 ap.add_argument("--bench-m", default="1,2,4,8,16")
+ap.add_argument("--bench-prefill", action="store_true")
+ap.add_argument("--prefill-m", default="2048,8192")
 ap.add_argument("--iters", type=int, default=100)
 ap.add_argument("--dtype", default="bf16")
 ap.add_argument("--out", default="")
@@ -99,20 +101,21 @@ def ptr_table(host, devarena, on_host_mask):
 
 
 def ref_moe(x, ids, w, L, cache):
-    """fp32 reference: per (token, expert) gate/up/down via trellis_core.reference.linear_forward."""
+    """fp32 reference: dense original-basis weights (trellis_core.reference.weight_orig), grouped by expert."""
     out = torch.zeros((x.shape[0], H), dtype=torch.float32, device=dev)
-    for m in range(x.shape[0]):
-        for k in range(ids.shape[1]):
-            e = int(ids[m, k])
-            if e not in cache:
-                cache[e] = {pr: {s: v.to(dev) for s, v in d.items()} for pr, d in expert_tensors(L, e).items()}
-            t = cache[e]
-            xm = x[m:m + 1].float()
-            g = ref.linear_forward(xm, t["gate_proj"]["trellis"], t["gate_proj"]["suh"], t["gate_proj"]["svh"], K, 2)
-            u = ref.linear_forward(xm, t["up_proj"]["trellis"], t["up_proj"]["suh"], t["up_proj"]["svh"], K, 2)
-            a = F.silu(g) * u
-            d = ref.linear_forward(a, t["down_proj"]["trellis"], t["down_proj"]["suh"], t["down_proj"]["svh"], K, 2)
-            out[m] += float(w[m, k]) * d[0]
+    xf = x.float()
+    flat = ids.flatten().long()
+    for e in torch.unique(flat).tolist():
+        if e not in cache:
+            t = {pr: {s_: v.to(dev) for s_, v in d.items()} for pr, d in expert_tensors(L, e).items()}
+            cache[e] = {pr: ref.weight_orig(t[pr]["trellis"], t[pr]["suh"], t[pr]["svh"], K, 2) for pr in t}
+        W = cache[e]
+        pos = (flat == e).nonzero().flatten()
+        rows, ks = pos // ids.shape[1], pos % ids.shape[1]
+        xs = xf[rows.to(dev)]
+        a = F.silu(xs @ W["gate_proj"]) * (xs @ W["up_proj"])
+        d = a @ W["down_proj"]
+        out.index_add_(0, rows.to(dev), d * w[rows, ks].to(dev).unsqueeze(1))
     return out
 
 
@@ -126,7 +129,7 @@ def routing(M, g=None, skew=None):
     return ids.to(torch.int32).to(dev), w.float().to(dev)
 
 
-res = {"check": [], "decode": []}
+res = {"check": [], "decode": [], "prefill": []}
 host, devarena = load_layer(args.layer)
 
 if args.check:
@@ -177,6 +180,30 @@ if args.bench_decode:
             rec = {"M": M, "placement": placement, "us_per_layer": round(us, 1), "unique_experts": n_unique,
                    "weight_GBps": round(gb / (us * 1e-6), 1), "ms_48_layers": round(us * 48 / 1e3, 2)}
             res["decode"].append(rec)
+            print(rec, flush=True)
+
+if args.bench_prefill:
+    for M in [int(v) for v in args.prefill_m.split(",")]:
+        x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
+        routs = [routing(M, torch.Generator().manual_seed(2000 + i)) for i in range(4)]
+        for placement in args.placements.split(","):
+            frac = {"device": 0.0, "host": 1.0, "mixed50": 0.5, "mixed20": 0.2}[placement]
+            mask = torch.rand(E, generator=torch.Generator().manual_seed(7)) < frac
+            ptrs = ptr_table(host, devarena, mask)
+            for ids, w in routs[:2]:
+                X.moe_forward(x, ids, w, ptrs, I, K, E)
+            torch.xpu.synchronize()
+            it = max(3, min(20, int(2e5 / M))) if placement == "device" else 3
+            t = time.perf_counter()
+            for i in range(it):
+                ids, w = routs[i % len(routs)]
+                X.moe_forward(x, ids, w, ptrs, I, K, E)
+            torch.xpu.synchronize()
+            ms = (time.perf_counter() - t) / it * 1e3
+            flops = M * TOPK * 3 * 2 * H * I
+            rec = {"M": M, "placement": placement, "ms_per_layer": round(ms, 3), "TFLOPS": round(flops / ms / 1e9, 1),
+                   "tok_per_s_48_layers_moe_only": round(M / (ms * 48 / 1e3), 0)}
+            res["prefill"].append(rec)
             print(rec, flush=True)
 
 if args.out:
