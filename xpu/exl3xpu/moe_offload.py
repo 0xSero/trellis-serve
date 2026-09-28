@@ -22,6 +22,8 @@ API (all device work is enqueued on the current XPU stream unless noted; nothing
   store.forward_cached(key, x, topk_ids, topk_w)            # decode with the DEVICE-managed LRU cache: misses are read
                                                              #   zero-copy and written through into LRU slots, the
                                                              #   table is repointed by the same call (no host sync)
+  store.prefetch(key, predicted_ids)                         # on a side stream between MoE calls: claim LRU slots for
+                                                             #   predicted experts, gather-copy them, repoint (X006)
   store.stage_layer(key, buf, stream) -> ptrs                # prefill: copy the layer's non-resident experts into
                                                              #   staging buffer buf (0/1) on `stream`; returns a
                                                              #   pointer table (slots for residents, staging else)
@@ -114,6 +116,8 @@ class ExpertStore:
         self.host_base = torch.zeros(max_layers, dtype=torch.int64, device=self.dev)
         self.fill_all = torch.zeros(LE, dtype=torch.int64, device=self.dev)
         self.fill_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
+        self.pf_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
+        self.pf_slot = torch.zeros(n_experts, dtype=torch.int32, device=self.dev)
         self.slot_base = s64(self.slots.data_ptr()) if n_slots else 0
         self._cache_used = False            # set by forward_cached: static ops must resync from the device first
 
@@ -242,6 +246,18 @@ class ExpertStore:
                                          self.fill_all, self.fill_list, self.E if max_fill is None else max_fill,
                                          self.I, self.K, self.E)
 
+    def prefetch(self, key, ids: torch.Tensor, max_fill: int = 16) -> None:
+        """Claim LRU slots for the (predicted) experts `ids` of layer `key` and copy them from host memory, on the
+        CURRENT stream -- use a side stream that waited for the previous MoE call, and make the compute stream wait
+        for it before the next MoE call. The tick is not advanced, so slots of the last MoE call are protected."""
+        if not self.n_slots:
+            return
+        ids = ids if ids.dtype == torch.int32 and ids.is_contiguous() else ids.to(torch.int32).contiguous()
+        self._cache_used = True
+        self.X.moe_prefetch(ids.flatten(), self.ptrs_all, self.layer_index[key], self.slot_of_dev, self.slot_key,
+                            self.slot_last, self.tick, self.host_base, self.slot_base, self.pf_list, self.pf_slot,
+                            max_fill, self.E, self.blob)
+
     # ---- prefill staging (FreeToken-style layer streaming)
     def stage_layer(self, key, buf: int, stream) -> torch.Tensor:
         """Copy every non-resident expert of `key` into staging buffer `buf` on `stream`; returns the pointer table
@@ -267,6 +283,21 @@ class ExpertStore:
             dp = self.slot_base + so.clamp_min(0).to(torch.int64) * self.blob
             sp = torch.where(so >= 0, dp, sp)
         return sp.to(self.dev, non_blocking=True)      # CPU mirror only: no device->host read
+
+    def reset_cache(self) -> None:
+        """Empty every slot and repoint all tables to host memory (current stream; waits for queued work)."""
+        torch.xpu.current_stream().synchronize()
+        for key, li in self.layer_index.items():
+            self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(self._host_ptr[key])
+            self.slot_of[key].fill_(-1)
+        self.slot_of_dev.fill_(-1)
+        self.slot_key.fill_(-1)
+        self.slot_last.fill_(-1)
+        self.fill_all.zero_()
+        self.slot_owner = [None] * self.n_slots
+        self.free_slots = list(range(self.n_slots - 1, -1, -1))
+        self._slot_ready_ev.clear()
+        self._cache_used = False
 
     def sync_mirror(self) -> None:
         """Rebuild the CPU mirror (slot_of, slot_owner, free list) from the device cache state. Device->host read of

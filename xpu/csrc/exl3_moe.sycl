@@ -806,7 +806,13 @@ static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, c
 //   the combine kernel commits ptrs[e] = slot. One work-group of 1024.
 static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer, int E, int S, int64_t* ptrs_all,
                           int* slot_of, int* slot_key, int* slot_last, int* tick, const int64_t* host_base,
-                          int64_t slot_base, int64_t blob, int64_t* fill_all, int* fill_list, int max_fill) {
+                          int64_t slot_base, int64_t blob, int64_t* fill_all, int* fill_list, int max_fill,
+                          int* pf_slot = nullptr) {
+    // pf_slot != nullptr: PREFETCH mode (side queue, between two MoE calls): the tick is not advanced, so slots
+    // touched by the last MoE call (last == T) stay protected; hits are re-stamped T; misses get LRU slots with
+    // last < T, recorded as fill_list = [n, e...], pf_slot = [s...] for the gather-copy + commit kernels (no
+    // write-through fills, fill_all untouched).
+    const bool prefetch = pf_slot != nullptr;
     constexpr int WG = 1024;
     // Victim selection = exact LRU by radix select over u = slot_last + 1 (empty slots u = 0, slots touched this tick
     // excluded): four 8-bit histogram passes find the nm-th smallest u (tau, ties needed), one compaction pass takes
@@ -819,7 +825,7 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
             auto g = it.get_group();
             using lref = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
                                           sycl::access::address_space::local_space>;
-            if (l == 0) { sc[0] = ++tick[0]; sc[1] = 0; sc[2] = 0; sc[3] = 0; }
+            if (l == 0) { sc[0] = prefetch ? tick[0] : ++tick[0]; sc[1] = 0; sc[2] = 0; sc[3] = 0; }
             for (int e = l; e < E; e += WG) need[e] = 0;
             sycl::group_barrier(g);
             for (int i = l; i < npairs; i += WG) need[ids[i]] = 1;
@@ -841,7 +847,7 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
             uint32_t umin = 0xFFFFFFFFu, umax = 0;
             for (int s = s0; s < s1; ++s) {
                 int la = slot_last[s];
-                if (la == T) continue;
+                if (la >= T) continue;
                 uint32_t u = (uint32_t)(la + 1);
                 ++elig; empty += la == -1;
                 umin = sycl::min(umin, u); umax = sycl::max(umax, u);
@@ -866,7 +872,7 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
                 int run_bin = -1, run_n = 0;
                 for (int s = s0; s < s1; ++s) {
                     int la = slot_last[s];
-                    if (la == T) continue;
+                    if (la >= T) continue;
                     uint32_t u = (uint32_t)(la + 1);
                     if ((u & hmask) != (prefix & hmask)) continue;
                     int b = (u >> shift) & 255;
@@ -890,7 +896,7 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
             int n_lt = 0, n_eq = 0;
             for (int s = s0; s < s1; ++s) {
                 int la = slot_last[s];
-                if (la == T) continue;
+                if (la >= T) continue;
                 uint32_t u = (uint32_t)(la + 1);
                 n_lt += u < prefix;
                 n_eq += u == prefix;
@@ -903,7 +909,7 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
             int ilt = base_lt, ieq = 0;
             for (int s = s0; s < s1; ++s) {
                 int la = slot_last[s];
-                if (la == T) continue;
+                if (la >= T) continue;
                 uint32_t u = (uint32_t)(la + 1);
                 if (u < prefix) vict[ilt++] = s;
                 else if (u == prefix && ieq < take_eq) vict[total_lt + base_eq + ieq++] = s;
@@ -919,7 +925,8 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
                 }
                 int key = layer * E + e;
                 slot_key[s] = key; slot_last[s] = T; slot_of[key] = s;
-                fill_all[key] = slot_base + (int64_t)s * blob;
+                if (prefetch) pf_slot[mi] = s;
+                else fill_all[key] = slot_base + (int64_t)s * blob;
                 fill_list[1 + mi] = e;
             }
             if (l == 0) fill_list[0] = nm;
@@ -930,6 +937,58 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
 static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, const int64_t* pp_override,
                                    at::Tensor ptrs, int64_t I, int64_t K, int64_t n_experts, const int64_t* fill,
                                    int64_t* commit_ptrs, int64_t* commit_fill, const int* fill_list);
+
+// Prefetch gather copy: WG per (prefetch entry i, 64 KiB chunk), 16 threads x 4 KiB, host USM -> device slot.
+struct PrefetchCopyKernel {
+    const int* pf_list; const int* pf_slot; const int64_t* host_base; int64_t slot_base; int64_t blob; int layer, E;
+    int chunks;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        int wg = it.get_group(0), t = it.get_local_id(0);
+        int i = wg / chunks, c = wg % chunks;
+        if (i >= pf_list[0]) return;
+        int e = pf_list[1 + i], s = pf_slot[i];
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(host_base[layer] + (int64_t)e * blob);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(slot_base + (int64_t)s * blob);
+        int64_t nd = blob / 4;
+        int64_t d0 = (int64_t)c * 16384 + (int64_t)t * 1024;    // dwords
+#pragma unroll 4
+        for (int k = 0; k < 16; ++k) {
+            int64_t o = d0 + k * 64;
+            if (o + 64 <= nd) block_store<uint32_t, 64>(dst + o, block_load<uint32_t, 64>(src + o));
+            else for (int64_t q = o; q < nd && q < o + 64; ++q) dst[q] = src[q];
+        }
+    }
+};
+
+// Prefetch: claim slots for predicted experts of `layer` (see launch_ensure prefetch mode), copy them from host,
+// then repoint the table. Enqueue on a SIDE stream that waited for the previous MoE call; make the compute stream
+// wait for this stream before the next MoE call of any layer.
+void moe_prefetch(at::Tensor ids, at::Tensor ptrs_all, int64_t layer, at::Tensor slot_of, at::Tensor slot_key,
+                  at::Tensor slot_last, at::Tensor tick, at::Tensor host_base, int64_t slot_base, at::Tensor pf_list,
+                  at::Tensor pf_slot, int64_t max_fill, int64_t n_experts, int64_t blob) {
+    TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous());
+    int E = (int)n_experts, S = (int)slot_key.numel();
+    if (S == 0 || ids.numel() == 0) return;
+    auto& q = queue_of(ids);
+    int mf = (int)std::min<int64_t>(max_fill, pf_slot.numel());
+    int64_t* pa = ptrs_all.data_ptr<int64_t>();
+    launch_ensure(q, ids.data_ptr<int>(), (int)ids.numel(), (int)layer, E, S, pa, slot_of.data_ptr<int>(),
+                  slot_key.data_ptr<int>(), slot_last.data_ptr<int>(), tick.data_ptr<int>(),
+                  host_base.data_ptr<int64_t>(), slot_base, blob, nullptr, pf_list.data_ptr<int>(), mf,
+                  pf_slot.data_ptr<int>());
+    int chunks = (int)((blob / 4 + 16383) / 16384);
+    PrefetchCopyKernel ck{pf_list.data_ptr<int>(), pf_slot.data_ptr<int>(), host_base.data_ptr<int64_t>(), slot_base,
+                          blob, (int)layer, E, chunks};
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)mf * chunks * 16, 16), ck); });
+    const int* pl = pf_list.data_ptr<int>();
+    const int* ps = pf_slot.data_ptr<int>();
+    int L = (int)layer;
+    q.submit([&](sycl::handler& h) {
+        h.single_task([=]() {
+            for (int i = 0; i < pl[0]; ++i) pa[L * E + pl[1 + i]] = slot_base + (int64_t)ps[i] * blob;
+        });
+    });
+}
 
 // Full routed-MoE forward (decode path: GEMV kernels).
 at::Tensor moe_forward(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, at::Tensor ptrs, int64_t I, int64_t K,
@@ -1057,6 +1116,10 @@ TORCH_LIBRARY(exl3xpu_moe, m) {
           "Tensor(c!) slot_key, Tensor(d!) slot_last, Tensor(e!) tick, Tensor host_base, int slot_base, Tensor(f!) fill_all, "
           "Tensor(g!) fill_list, int max_fill, int I, int K, int n_experts) -> Tensor");
     m.impl("moe_forward_cached", torch::kXPU, &moe::moe_forward_cached);
+    m.def("moe_prefetch(Tensor ids, Tensor(a!) ptrs_all, int layer, Tensor(b!) slot_of, Tensor(c!) slot_key, "
+          "Tensor(d!) slot_last, Tensor tick, Tensor host_base, int slot_base, Tensor(e!) pf_list, Tensor(f!) pf_slot, "
+          "int max_fill, int n_experts, int blob) -> ()");
+    m.impl("moe_prefetch", torch::kXPU, &moe::moe_prefetch);
     m.def("moe_align(Tensor topk_ids, Tensor topk_w, int n_experts, int pad) -> Tensor[]");
     m.impl("moe_align", torch::kXPU, &moe::moe_align);
     m.def("host_alloc(int nbytes) -> Tensor", &moe::host_alloc);
