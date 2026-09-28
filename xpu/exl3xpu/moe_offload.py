@@ -19,6 +19,9 @@ API (all device work is enqueued on the current XPU stream unless noted; nothing
   store.make_resident(key, experts, stream=None)             # copy blobs into free/evicted slots, then repoint
   store.evict(key, experts)                                  # repoint to host (slot freed; reuse is stream-ordered)
   store.forward(key, x, topk_ids, topk_w) -> out             # routed-MoE output (weights applied, shared expert NOT)
+  store.forward_cached(key, x, topk_ids, topk_w)            # decode with the DEVICE-managed LRU cache: misses are read
+                                                             #   zero-copy and written through into LRU slots, the
+                                                             #   table is repointed by the same call (no host sync)
   store.stage_layer(key, buf, stream) -> ptrs                # prefill: copy the layer's non-resident experts into
                                                              #   staging buffer buf (0/1) on `stream`; returns a
                                                              #   pointer table (slots for residents, staging else)
@@ -46,6 +49,11 @@ def ops():
             @torch.library.register_fake("exl3xpu_moe::moe_forward")
             def _fake(x, topk_ids, topk_w, ptrs, I, K, n_experts):   # noqa: N803
                 return torch.empty_like(x)
+
+            if hasattr(torch.ops.exl3xpu_moe, "moe_forward_cached"):
+                @torch.library.register_fake("exl3xpu_moe::moe_forward_cached")
+                def _fake_c(x, *args):
+                    return torch.empty_like(x)
 
             _lib_loaded = True
     return torch.ops.exl3xpu_moe
@@ -80,31 +88,48 @@ def pack_expert(gate: dict, up: dict, down: dict, K: int, out: torch.Tensor | No
 
 
 class ExpertStore:
-    def __init__(self, H: int, I: int, K: int, n_experts: int, n_slots: int, device=None):
+    def __init__(self, H: int, I: int, K: int, n_experts: int, n_slots: int, device=None, max_layers: int = 64):
         self.H, self.I, self.K, self.E = H, I, K, n_experts
         self.dev = device or torch.device("xpu", torch.xpu.current_device())
         self.X = ops()
         self.blob = int(self.X.blob_bytes(H, I, K))
         self.n_slots = n_slots
+        self.max_layers = max_layers
         self.slots = torch.empty((n_slots, self.blob), dtype=torch.uint8, device=self.dev) if n_slots else None
-        self.slot_owner: list = [None] * n_slots            # slot -> (key, e)
+        self.slot_owner: list = [None] * n_slots            # slot -> (key, e)   (static placement mirror)
         self.free_slots = list(range(n_slots - 1, -1, -1))
         self.host: dict = {}                                # key -> uint8 CPU tensor [E, BLOB] (USM host)
-        self._ptrs: dict = {}                               # key -> device int64 [E]
-        self.slot_of: dict = {}                             # key -> cpu int32 [E]
+        self.layer_index: dict = {}                         # key -> row in the device tables
+        self.slot_of: dict = {}                             # key -> cpu int32 [E] (mirror of static placement)
+        self._host_ptr: dict = {}
         self._stage = [None, None]
-        self._slot_ready_ev: dict = {}                      # slot -> event after which the slot may be overwritten
+        self._slot_ready_ev: dict = {}
+        # device-side cache state (authoritative for forward_cached)
+        LE = max_layers * n_experts
+        self.ptrs_all = torch.zeros(LE, dtype=torch.int64, device=self.dev)
+        self.slot_of_dev = torch.full((LE,), -1, dtype=torch.int32, device=self.dev)
+        self.slot_key = torch.full((n_slots,), -1, dtype=torch.int32, device=self.dev)
+        self.slot_last = torch.full((n_slots,), -1, dtype=torch.int32, device=self.dev)
+        self.tick = torch.zeros(1, dtype=torch.int32, device=self.dev)
+        self.host_base = torch.zeros(max_layers, dtype=torch.int64, device=self.dev)
+        self.fill_all = torch.zeros(LE, dtype=torch.int64, device=self.dev)
+        self.fill_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
+        self.slot_base = s64(self.slots.data_ptr()) if n_slots else 0
 
     # ---- layers
     def add_layer(self, key, blobs: torch.Tensor | None = None) -> torch.Tensor:
+        li = len(self.layer_index)
+        if li >= self.max_layers:
+            raise RuntimeError(f"ExpertStore: more than max_layers={self.max_layers} MoE layers")
+        self.layer_index[key] = li
         h = self.X.host_alloc(self.E * self.blob).view(self.E, self.blob)
         if blobs is not None:
             h.copy_(blobs)
         self.host[key] = h
         base = s64(h.data_ptr())
-        self._host_ptr = getattr(self, "_host_ptr", {})
         self._host_ptr[key] = base + torch.arange(self.E, dtype=torch.int64) * self.blob
-        self._ptrs[key] = self._host_ptr[key].to(self.dev)
+        self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(self._host_ptr[key])
+        self.host_base[li] = base
         self.slot_of[key] = torch.full((self.E,), -1, dtype=torch.int32)
         return h
 
@@ -112,21 +137,23 @@ class ExpertStore:
         return self.host[key]
 
     def ptrs(self, key) -> torch.Tensor:
-        return self._ptrs[key]
+        li = self.layer_index[key]
+        return self.ptrs_all[li * self.E:(li + 1) * self.E]
 
     def slot_ptr(self, s: int) -> int:
-        return s64(self.slots.data_ptr()) + s * self.blob
+        return self.slot_base + s * self.blob
 
-    # ---- residency
+    # ---- static residency (load time / host-driven policies)
     def make_resident(self, key, experts, stream=None) -> int:
-        """Copy experts into device slots (free ones first, else evict the oldest owner), then repoint the table.
-        Copies and the table update are ordered on `stream` (default: current stream). Returns #copied."""
+        """Copy experts into free device slots, then repoint the table (and the device slot map). Copies and the
+        table update are ordered on `stream` (default: current stream). Returns #copied."""
         s_ = stream or torch.xpu.current_stream()
         so = self.slot_of[key]
+        li = self.layer_index[key]
         todo = [int(e) for e in experts if so[int(e)] < 0]
         if not todo:
             return 0
-        upd_idx, upd_val = [], []
+        es, sls = [], []
         with torch.xpu.stream(s_):
             for e in todo:
                 if not self.free_slots:
@@ -138,35 +165,44 @@ class ExpertStore:
                 self.X.memcpy_async(self.slot_ptr(sl), s64(self.host[key][e].data_ptr()), self.blob)
                 self.slot_owner[sl] = (key, e)
                 so[e] = sl
-                upd_idx.append(e)
-                upd_val.append(self.slot_ptr(sl))
-            # table update after the data (same queue => ordered)
-            idx = torch.tensor(upd_idx, dtype=torch.int64).to(self.dev, non_blocking=True)
-            val = torch.tensor(upd_val, dtype=torch.int64).to(self.dev, non_blocking=True)
-            self._ptrs[key].index_copy_(0, idx, val)
+                es.append(e)
+                sls.append(sl)
+            keys = torch.tensor([li * self.E + e for e in es], dtype=torch.int64)
+            slt = torch.tensor(sls, dtype=torch.int64)
+            d = self.dev
+            self.ptrs_all.index_copy_(0, keys.to(d), (self.slot_base + slt * self.blob).to(d))
+            self.slot_of_dev.index_copy_(0, keys.to(d), slt.to(torch.int32).to(d))
+            self.slot_key.index_copy_(0, slt.to(d), keys.to(torch.int32).to(d))
+            self.slot_last.index_fill_(0, slt.to(d), 0)
         return len(todo)
 
     def evict(self, key, experts) -> None:
         """Repoint to the host copy; the slot becomes reusable after the current stream's already-queued work."""
         so = self.slot_of[key]
-        ev_needed = []
-        idx = []
+        li = self.layer_index[key]
+        es, sls = [], []
         for e in experts:
             e = int(e)
             sl = int(so[e])
             if sl < 0:
                 continue
-            idx.append(e)
+            es.append(e)
+            sls.append(sl)
             so[e] = -1
             self.slot_owner[sl] = None
-            ev_needed.append(sl)
-        if not idx:
+        if not es:
             return
-        it = torch.tensor(idx, dtype=torch.int64)
-        self._ptrs[key].index_copy_(0, it.to(self.dev), self._host_ptr[key][it].to(self.dev))
+        d = self.dev
+        et = torch.tensor(es, dtype=torch.int64)
+        keys = (li * self.E + et).to(d)
+        slt = torch.tensor(sls, dtype=torch.int64).to(d)
+        self.ptrs_all.index_copy_(0, keys, self._host_ptr[key][et].to(d))
+        self.slot_of_dev.index_fill_(0, keys, -1)
+        self.slot_key.index_fill_(0, slt, -1)
+        self.slot_last.index_fill_(0, slt, -1)
         ev = torch.xpu.Event()
         ev.record(torch.xpu.current_stream())
-        for sl in ev_needed:
+        for sl in sls:
             self._slot_ready_ev[sl] = ev
             self.free_slots.append(sl)
 
@@ -175,16 +211,38 @@ class ExpertStore:
             return sum(int((v >= 0).sum()) for v in self.slot_of.values())
         return int((self.slot_of[key] >= 0).sum())
 
+    def device_resident_count(self, key) -> int:
+        """From the device slot map (syncs; debug/metrics only)."""
+        li = self.layer_index[key]
+        return int((self.slot_of_dev[li * self.E:(li + 1) * self.E] >= 0).sum().item())
+
     # ---- compute
-    def forward(self, key, x: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch.Tensor, ptrs=None) -> torch.Tensor:
+    @staticmethod
+    def _rt(topk_ids, topk_w):
         ids = topk_ids if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous() else topk_ids.to(torch.int32).contiguous()
         w = topk_w if topk_w.dtype == torch.float32 and topk_w.is_contiguous() else topk_w.to(torch.float32).contiguous()
-        return self.X.moe_forward(x, ids, w, self._ptrs[key] if ptrs is None else ptrs, self.I, self.K, self.E)
+        return ids, w
+
+    def forward(self, key, x: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch.Tensor, ptrs=None) -> torch.Tensor:
+        ids, w = self._rt(topk_ids, topk_w)
+        return self.X.moe_forward(x, ids, w, self.ptrs(key) if ptrs is None else ptrs, self.I, self.K, self.E)
+
+    def forward_cached(self, key, x: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch.Tensor,
+                       max_fill: int | None = None) -> torch.Tensor:
+        """Decode with the device-managed LRU expert cache: hits read their slot, misses read host memory zero-copy
+        and are written through into the LRU slot (committed at the end of the call). No host sync, graph-safe.
+        Do not mix with make_resident/evict on the same slots while cached calls are queued."""
+        ids, w = self._rt(topk_ids, topk_w)
+        return self.X.moe_forward_cached(x, ids, w, self.ptrs_all, self.layer_index[key], self.slot_of_dev,
+                                         self.slot_key, self.slot_last, self.tick, self.host_base, self.slot_base,
+                                         self.fill_all, self.fill_list, self.E if max_fill is None else max_fill,
+                                         self.I, self.K, self.E)
 
     # ---- prefill staging (FreeToken-style layer streaming)
     def stage_layer(self, key, buf: int, stream) -> torch.Tensor:
         """Copy every non-resident expert of `key` into staging buffer `buf` on `stream`; returns the pointer table
-        to pass to forward(ptrs=...) once `stream` has been waited on. Contiguous expert runs are copied together."""
+        to pass to forward(ptrs=...) once `stream` has been waited on. Contiguous expert runs are copied together.
+        Uses the static-placement mirror (slot_of); after forward_cached calls, refresh it with sync_mirror()."""
         if self._stage[buf] is None:
             self._stage[buf] = torch.empty((self.E, self.blob), dtype=torch.uint8, device=self.dev)
         st = self._stage[buf]
@@ -201,6 +259,12 @@ class ExpertStore:
                 i = j + 1
         sp = s64(st.data_ptr()) + torch.arange(self.E, dtype=torch.int64) * self.blob
         if self.n_slots:
-            dp = s64(self.slots.data_ptr()) + so.clamp_min(0).to(torch.int64) * self.blob
+            dp = self.slot_base + so.clamp_min(0).to(torch.int64) * self.blob
             sp = torch.where(so >= 0, dp, sp)
         return sp.to(self.dev, non_blocking=True)      # CPU mirror only: no device->host read
+
+    def sync_mirror(self) -> None:
+        """Refresh the CPU slot mirror from the device cache state (device->host read; not for the decode loop)."""
+        sod = self.slot_of_dev.cpu()
+        for key, li in self.layer_index.items():
+            self.slot_of[key] = sod[li * self.E:(li + 1) * self.E].clone()
