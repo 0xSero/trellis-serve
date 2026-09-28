@@ -23,6 +23,7 @@ ap.add_argument("--lib", default=os.environ.get("EXL3_LIB", os.path.join(HERE, "
 ap.add_argument("--layers", default="0,1,23,46,47")
 ap.add_argument("--experts", type=int, default=6)
 ap.add_argument("--bench", action="store_true")
+ap.add_argument("--dense-regex", default="", help="validate these (non-expert) tensors instead, any K")
 ap.add_argument("--out", default="")
 args = ap.parse_args()
 
@@ -45,15 +46,34 @@ fails = []
 rng = random.Random(0)
 layers = [int(x) for x in args.layers.split(",")]
 t0 = time.time()
-for L in layers:
-    for e in sorted(rng.sample(range(512), args.experts)):
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            key = f"model.language_model.layers.{L}.mlp.experts.{e}.{proj}"
+import re as _re
+
+
+def work():
+    if args.dense_regex:
+        rx = _re.compile(args.dense_regex)
+        for name in sorted(idx):
+            if name.endswith(".trellis") and rx.search(name):
+                yield None, name[:-len(".trellis")]
+        return
+    for L in layers:
+        for e in sorted(rng.sample(range(512), args.experts)):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                yield L, f"model.language_model.layers.{L}.mlp.experts.{e}.{proj}"
+
+
+lastL = None
+for L, key in work():
+            if L != lastL and lastL is not None:
+                print(f"layer {lastL} done ({time.time() - t0:.1f}s), fails so far {len(fails)}", flush=True)
+            lastL = L
             assert f"{key}.mul1" in idx, key
             tr = get(f"{key}.trellis").to(dev)
             suh, svh = get(f"{key}.suh").to(dev), get(f"{key}.svh").to(dev)
             K = tr.shape[-1] // 16
-            assert K == 3, (key, K)
+            assert K == 3 or args.dense_regex, (key, K)
+            res.setdefault("K_seen", {}).setdefault(str(K), 0)
+            res["K_seen"][str(K)] += 1
             cb = ref.CB_MUL1
             k, n = tr.shape[0] * 16, tr.shape[1] * 16
             wr = ref.reconstruct_inner(tr, K, cb)
@@ -88,7 +108,7 @@ for L in layers:
                 res["linear"].append(err)
                 if err > 2e-3:
                     fails.append(f"linear {key} M={M}: rel max err {err:.2e}")
-    print(f"layer {L} done ({time.time() - t0:.1f}s), fails so far {len(fails)}", flush=True)
+print(f"done ({time.time() - t0:.1f}s), fails {len(fails)}, K seen {res.get('K_seen')}", flush=True)
 
 print("reconstruct tensors:", len(res["reconstruct"]), "mismatching elems:", sum(res["reconstruct"]))
 print("onehot cases:", len(res["onehot"]), "mismatching:", sum(res["onehot"]))
