@@ -158,3 +158,27 @@ def run(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, bloc
     mod.moe_gemm_ptr(xd, yd, table, F_W2, F_SVH2, lay.bits, sorted_ids, expert_ids, num_post_padded, block, 0, cb, wb=admit)
     mod.moe_combine(yd, topk_weights, topk_ids, table.shape[0], y)
     return y
+
+
+_ident_maps: dict = {}
+
+
+def align_decode(topk_ids: torch.Tensor, block: int, num_experts: int):
+    """Decode-sized moe_align_block_size in ONE launch (csrc moe_align_decode, identity expert map): same
+    (sorted_ids, expert_ids, num_post_padded) contract as SGLang's align with ignore_invalid_expert=True (ids outside
+    [0, E) dropped, padding = numel, padding blocks -1). Order of slots inside an expert's block may differ (rows are
+    independent: results are bit-identical). topk_ids int32; slots <= 4096, E <= 1024. Graph-capturable."""
+    key = (num_experts, topk_ids.device)
+    m = _ident_maps.get(key)
+    if m is None:
+        m = _ident_maps[key] = torch.arange(num_experts, dtype=torch.int32, device=topk_ids.device)
+    ids = topk_ids.reshape(-1)
+    if ids.dtype != torch.int32:
+        ids = ids.to(torch.int32)
+    slots = ids.numel()
+    cap = marlin_moe.align_capacity(slots, num_experts, block)
+    sorted_ids = torch.empty((cap,), dtype=torch.int32, device=ids.device)
+    eids = torch.empty(((cap + block - 1) // block,), dtype=torch.int32, device=ids.device)
+    post = torch.empty((1,), dtype=torch.int32, device=ids.device)
+    _mod().moe_align_decode(ids.contiguous(), [m], [int(block)], num_experts, [sorted_ids], [eids], [post])
+    return sorted_ids, eids, post

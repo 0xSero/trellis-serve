@@ -31,7 +31,12 @@ from .moe_parity_sm86 import load_layer, exact_layer
 _PROJ = ("gate_proj", "up_proj", "down_proj")
 
 
+FAST_ALIGN = os.environ.get("OFFLOAD_FAST_ALIGN", "0") == "1"
+
+
 def align(ids, block, e):
+    if FAST_ALIGN and ids.numel() <= 4096:
+        return offload_moe.align_decode(ids, block, e)
     from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import moe_align_block_size
     return moe_align_block_size(ids, block, e, ignore_invalid_expert=True)   # drop sentinel = e
 
@@ -223,10 +228,10 @@ def bench_decode(L: Layer, gen, tokens: int, where: str, reps: int) -> dict:
             "zero_copy_GBps": (host_bytes / (med * 1e-6) / 1e9) if host_bytes else None}
 
 
-def bench_prefill(L: Layer, gen, tokens: int, reps: int, stacked=False) -> dict:
+def bench_prefill(L: Layer, gen, tokens: int, reps: int, stacked=False, where="device") -> dict:
     ids, w = uniform_routing(tokens, 10, L.e, gen)
     x = (torch.randn((tokens, L.hidden), generator=gen) * 0.5).to(torch.bfloat16).cuda()
-    L.set_table("device")
+    L.set_table(where)
     fn = L.run_stack if stacked else L.run_ptr
     for _ in range(3):
         fn(x, ids, w)
@@ -237,8 +242,11 @@ def bench_prefill(L: Layer, gen, tokens: int, reps: int, stacked=False) -> dict:
         a.record(); fn(x, ids, w); b.record(); torch.cuda.synchronize()
         times.append(a.elapsed_time(b))
     med = median_ms(times)
-    return {"tokens": tokens, "path": "stacked" if stacked else "ptr_device", "median_ms": med, "reps": reps,
-            "tok_per_s_moe_layer": tokens / (med * 1e-3)}
+    block = marlin_moe.moe_block_size(tokens, 10, L.e)
+    _, _, npost = align(ids, block, L.e)
+    return {"tokens": tokens, "path": "stacked" if stacked else f"ptr_{where}", "median_ms": med, "reps": reps,
+            "tok_per_s_moe_layer": tokens / (med * 1e-3), "block": block, "moe_blocks": int(npost.item()) // block,
+            "host_GBps_if_host": (int(npost.item()) // block) * L.lay.record_bytes / (med * 1e-3) / 1e9 if where == "host" else None}
 
 
 def bench_copy_overlap(L: Layer, gen, tokens: int, reps: int) -> dict:
@@ -526,6 +534,10 @@ def main():
         for tokens in [int(t) for t in a.decode_tokens.split(",") if t]:
             for where in ("device", "host", "mixed"):
                 print("decode", bench_decode(L, gen, tokens, where, a.reps), flush=True)
+    if "prefill_host" in only:
+        for tokens in [int(t) for t in a.prefill_tokens.split(",") if t]:
+            for where in ("device", "host"):
+                print("prefill", bench_prefill(L, gen, tokens, a.prefill_reps, False, where), flush=True)
     if "gather" in only:
         r = bench_gather_then_compute(L, gen, a.reps)
         print("gather_then_compute", r, flush=True)

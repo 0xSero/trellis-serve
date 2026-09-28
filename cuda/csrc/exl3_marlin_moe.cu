@@ -587,6 +587,106 @@ void moe_copy_fields(const at::Tensor& src, const at::Tensor& dst, const at::Ten
       (int)src.size(0), (int)field, (int)(nbytes / 16));
 }
 
+// Record copy (copy-in / prefetch / eviction), graph-safe: entry i < *count (count = nullptr: all n entries) copies
+// nbytes from src[i] to dst[i] (absolute addresses; 0 = skip). grid (chunks, n): block (c, i) copies chunk c of entry
+// i with 16-byte loads, UNROLL loads in flight per thread before the stores (PCIe reads need many requests in flight).
+template <int UNROLL>
+__global__ __launch_bounds__(256) void trellis_copy_records_kernel(const int64_t* __restrict__ src,
+                                                                   const int64_t* __restrict__ dst,
+                                                                   const int* __restrict__ count, int64_t n16,
+                                                                   int64_t chunk16) {
+  const int i = blockIdx.y;
+  if (count != nullptr && i >= *count) return;
+  const int4* s = reinterpret_cast<const int4*>(src[i]);
+  int4* d = reinterpret_cast<int4*>(dst[i]);
+  if (s == nullptr || d == nullptr) return;
+  const int64_t beg = (int64_t)blockIdx.x * chunk16, end = min(beg + chunk16, n16);
+  for (int64_t base = beg + threadIdx.x; base < end; base += 256 * UNROLL) {
+    int4 v[UNROLL];
+  #pragma unroll
+    for (int u = 0; u < UNROLL; u++) {
+      const int64_t j = base + u * 256;
+      if (j < end) v[u] = __ldg(s + j);
+    }
+  #pragma unroll
+    for (int u = 0; u < UNROLL; u++) {
+      const int64_t j = base + u * 256;
+      if (j < end) d[j] = v[u];
+    }
+  }
+}
+
+// Small-footprint variant: `blocks` persistent 512-thread blocks grid-stride over all (entry, 8 KB piece) items with 8
+// x 16-B loads in flight per thread (64 KB per block): a prefetch that leaves the other SMs to concurrent kernels.
+__global__ __launch_bounds__(512) void trellis_copy_records_persistent_kernel(const int64_t* __restrict__ src,
+                                                                              const int64_t* __restrict__ dst,
+                                                                              const int* __restrict__ count, int n,
+                                                                              int64_t n16) {
+  const int cnt = count != nullptr ? min(*count, n) : n;
+  constexpr int kPiece16 = 512 * 8;  // one piece = 64 KB = one pass of the block
+  const int64_t pieces = (n16 + kPiece16 - 1) / kPiece16, total = (int64_t)cnt * pieces;
+  for (int64_t it = blockIdx.x; it < total; it += gridDim.x) {
+    const int i = (int)(it / pieces);
+    const int4* s = reinterpret_cast<const int4*>(src[i]);
+    int4* d = reinterpret_cast<int4*>(dst[i]);
+    if (s == nullptr || d == nullptr) continue;
+    const int64_t beg = (it % pieces) * kPiece16;
+    int4 v[8];
+  #pragma unroll
+    for (int u = 0; u < 8; u++) {
+      const int64_t j = beg + u * 512 + threadIdx.x;
+      if (j < n16) v[u] = __ldg(s + j);
+    }
+  #pragma unroll
+    for (int u = 0; u < 8; u++) {
+      const int64_t j = beg + u * 512 + threadIdx.x;
+      if (j < n16) d[j] = v[u];
+    }
+  }
+}
+
+static int g_copy_chunk_kb = 64;  // knob: bytes per block (KB)
+
+void copy_records(const at::Tensor& src, const at::Tensor& dst, int64_t nbytes, const c10::optional<at::Tensor>& count,
+                  int64_t unroll) {
+  const at::cuda::OptionalCUDAGuard device_guard(src.device());
+  TORCH_CHECK(src.is_cuda() && dst.is_cuda() && src.dtype() == at::kLong && dst.dtype() == at::kLong);
+  TORCH_CHECK(src.is_contiguous() && dst.is_contiguous() && src.numel() == dst.numel() && nbytes % 16 == 0);
+  const int* cp = nullptr;
+  if (count.has_value()) {
+    TORCH_CHECK(count->is_cuda() && count->dtype() == at::kInt && count->numel() == 1);
+    cp = count->data_ptr<int>();
+  }
+  const int64_t n = src.numel();
+  if (n == 0 || nbytes == 0) return;
+  const int64_t n16 = nbytes / 16, chunk16 = (int64_t)g_copy_chunk_kb * 1024 / 16;
+  dim3 grid((unsigned)((n16 + chunk16 - 1) / chunk16), (unsigned)n);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  const int64_t* sp = src.data_ptr<int64_t>(); const int64_t* dp = dst.data_ptr<int64_t>();
+  if (unroll == 1) trellis_copy_records_kernel<1><<<grid, 256, 0, stream>>>(sp, dp, cp, n16, chunk16);
+  else if (unroll == 2) trellis_copy_records_kernel<2><<<grid, 256, 0, stream>>>(sp, dp, cp, n16, chunk16);
+  else if (unroll == 8) trellis_copy_records_kernel<8><<<grid, 256, 0, stream>>>(sp, dp, cp, n16, chunk16);
+  else trellis_copy_records_kernel<4><<<grid, 256, 0, stream>>>(sp, dp, cp, n16, chunk16);
+}
+
+void copy_records_persistent(const at::Tensor& src, const at::Tensor& dst, int64_t nbytes,
+                             const c10::optional<at::Tensor>& count, int64_t blocks) {
+  const at::cuda::OptionalCUDAGuard device_guard(src.device());
+  TORCH_CHECK(src.is_cuda() && dst.is_cuda() && src.dtype() == at::kLong && dst.dtype() == at::kLong);
+  TORCH_CHECK(src.is_contiguous() && dst.is_contiguous() && src.numel() == dst.numel() && nbytes % 16 == 0);
+  TORCH_CHECK(blocks >= 1 && blocks <= 4096);
+  const int* cp = nullptr;
+  if (count.has_value()) {
+    TORCH_CHECK(count->is_cuda() && count->dtype() == at::kInt && count->numel() == 1);
+    cp = count->data_ptr<int>();
+  }
+  if (src.numel() == 0 || nbytes == 0) return;
+  trellis_copy_records_persistent_kernel<<<(unsigned)blocks, 512, 0, at::cuda::getCurrentCUDAStream().stream()>>>(
+      src.data_ptr<int64_t>(), dst.data_ptr<int64_t>(), cp, (int)src.numel(), nbytes / 16);
+}
+
+void set_copy_chunk_kb(int64_t kb) { TORCH_CHECK(kb >= 4 && kb <= 65536); g_copy_chunk_kb = (int)kb; }
+
 // ---------------------------------------------------------------------------------------------------------------
 // Host tier helpers: pinned + mapped host memory whose UVA address the kernels can dereference (zero-copy over PCIe).
 
@@ -785,6 +885,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("ptrs"), py::arg("field"), py::arg("shards"), py::arg("ids"), py::arg("xh"));
   m.def("moe_glu_had_in_ptr", &moe_glu_had_in_ptr, "moe_glu_had_in with suh_down from the pointer table",
         py::arg("gu"), py::arg("ptrs"), py::arg("field"), py::arg("ids"), py::arg("act_tmp"), py::arg("xd"));
+  m.def("copy_records", &copy_records, "graph-safe record copy: entry i < count copies nbytes src[i] -> dst[i] (0 = skip)",
+        py::arg("src"), py::arg("dst"), py::arg("nbytes"), py::arg("count") = py::none(), py::arg("unroll") = 4);
+  m.def("copy_records_persistent", &copy_records_persistent,
+        "copy_records with `blocks` persistent 512-thread blocks (small SM footprint, for prefetch next to compute)",
+        py::arg("src"), py::arg("dst"), py::arg("nbytes"), py::arg("count") = py::none(), py::arg("blocks") = 8);
+  m.def("set_copy_chunk_kb", &set_copy_chunk_kb, "knob: KB per block in copy_records (default 64)");
   m.def("host_alloc_mapped", &host_alloc_mapped, "uint8 CPU tensor from cudaHostAlloc(Portable|Mapped), exact size");
   m.def("host_register", &host_register, "cudaHostRegister(Portable|Mapped) a CPU tensor in place");
   m.def("host_unregister", &host_unregister, "cudaHostUnregister");
