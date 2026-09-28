@@ -131,6 +131,28 @@ class Exl3NgramHostTable(torch.nn.Module):
         self.embedding_dim = 160
         self.num_embeddings = self.num_rows
 
+    def release(self) -> None:
+        """Unregister and unmap the host table. Must precede freeing the mapping: a registration that outlives its
+        mapping keeps the old pages behind that VA range in CUDA's UVA map, and a later mapping placed at the same
+        address (e.g. the CPU MoE worker's shared control block) would be read/written by the GPU through the stale
+        pages (seen as a lost-flag hang in offload_selftest)."""
+        if getattr(self, "host", None) is None:
+            return
+        from exllamav3.model.model_tp_cuda import cuda_host_unregister
+        torch.cuda.synchronize()
+        cuda_host_unregister(self.host.data_ptr())
+        self.host = None
+        try:
+            self._map.close()
+        except BufferError:
+            pass
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         if ids.shape[-1] != self.num_heads:
             raise ValueError(f"n-gram lookup expects [..., {self.num_heads}] ids, got {tuple(ids.shape)}")

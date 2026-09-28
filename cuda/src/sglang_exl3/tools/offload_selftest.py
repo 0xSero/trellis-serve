@@ -71,6 +71,7 @@ def ngram_test(model, res):
     tab(x); torch.cuda.synchronize()
     res["ngram_ms_16k_tokens"] = round((time.perf_counter() - t0) * 1e3, 2)
     print("ngram:", {k: v for k, v in res.items() if k.startswith("ngram")}, flush=True)
+    return tab      # kept alive like in the server (see Exl3NgramHostTable.release)
 
 
 def moe_test(model, layers, res):
@@ -109,6 +110,19 @@ def moe_test(model, layers, res):
         lids.append(host.register_layer(f"{pre}", keys["gate"], keys["up"], keys["down"], 0, 0.0, H, H, topk,
                                         proj_dims=pd, aux=aux))
     host.ensure_started()
+    def sync(tag, limit=90):
+        ev = torch.cuda.Event(); ev.record()
+        t0 = time.time()
+        while not ev.query():
+            if time.time() - t0 > limit:
+                import numpy as _np
+                from exllamav3.model import moe_cpu_host as _m
+                u = _np.frombuffer(host.shm.buf, dtype=_np.uint32); F = _m.MOE_SLOT_FLAGS_OFFSET // 4
+                raise RuntimeError(f"{tag}: GPU stream stuck > {limit}s: devseq {u[1]} abort {u[32]} tail {u[64]} head {u[80]} "
+                                   f"data_ready {[int(u[F + 16 * s]) for s in range(4)]} done {[int(u[F + 128 + 16 * s]) for s in range(4)]} "
+                                   f"consumed {[int(u[F + 256 + 16 * s]) for s in range(4)]} host.seq {host.seq}")
+            time.sleep(0.005)
+
     res["moe_load_s"] = round(time.time() - t0, 1)
     cpu_moe._STATE["host"] = host
     d = cpu_moe._DevPath(host, dev)
@@ -124,6 +138,7 @@ def moe_test(model, layers, res):
         return x, ids, w
 
     def stock(L, x, ids, w):
+        sync('stock-entry')      # same hand-over as Exl3CpuMoEMethod._host_path
         host.seq = int(d.devseq[0]); host.slot_last_seq = [0] * len(host.slot_last_seq)
         host.begin_pass()
         o = host.submit(L, x.to(torch.float16).contiguous(), ids.long(), w.to(torch.float16).contiguous())
@@ -171,9 +186,10 @@ def moe_test(model, layers, res):
     for t in (1, 2, 7, 32):
         for li, l in enumerate(lay):
             x, ids, w = rnd(t, 100 * t + li)
+            print('cmp', t, li, flush=True)
             a = meth._device_path(l, x, ids, w)
             b = stock(l.exl3_cpu_idx, x, ids, w).to(torch.bfloat16)
-            torch.cuda.synchronize()
+            sync('s1')
             ok_bit &= torch.equal(a, b)
             if t <= 2:
                 r = ref64(li, x, ids, w)
@@ -189,7 +205,7 @@ def moe_test(model, layers, res):
         for (x, ids, w), l in zip(stat, lay):
             meth._device_path(l, x, ids, w)
     torch.cuda.current_stream().wait_stream(s)
-    torch.cuda.synchronize()
+    sync('s2')
     gr = torch.cuda.CUDAGraph()
     with torch.cuda.graph(gr):
         gout = [meth._device_path(l, x, ids, w) for (x, ids, w), l in zip(stat, lay)]
@@ -199,19 +215,19 @@ def moe_test(model, layers, res):
             nx, ni, nw = rnd(t, 1000 + 10 * rep + i)
             x.copy_(nx); ids.copy_(ni); w.copy_(nw)
         gr.replay()
-        torch.cuda.synchronize()
+        sync('s3')
         for i, ((x, ids, w), l) in enumerate(zip(stat, lay)):
             ok &= torch.equal(gout[i], meth._device_path(l, x, ids, w))
         # interleave a stock host-path call between replays
         stock(lay[0].exl3_cpu_idx, *rnd(3, 5000 + rep))
-    torch.cuda.synchronize()
+    sync('s4')
     res["moe_graph_eq_eager_interleaved"] = bool(ok)
     # decode handoff latency per layer (graph replay of all layers / n layers)
-    torch.cuda.synchronize()
+    sync('s5')
     t0 = time.perf_counter()
     for _ in range(50):
         gr.replay()
-    torch.cuda.synchronize()
+    sync('s6')
     res["moe_dev_us_per_layer_4tok"] = round((time.perf_counter() - t0) / 50 / len(lay) * 1e6, 1)
     t = 1
     stat1 = [rnd(1, 77 + i) for i in range(len(lay))]
@@ -219,21 +235,21 @@ def moe_test(model, layers, res):
     with torch.cuda.graph(gr1):
         for (x, ids, w), l in zip(stat1, lay):
             meth._device_path(l, x, ids, w)
-    torch.cuda.synchronize()
+    sync('s7')
     t0 = time.perf_counter()
     for _ in range(100):
         gr1.replay()
-    torch.cuda.synchronize()
+    sync('s8')
     res["moe_dev_us_per_layer_1tok"] = round((time.perf_counter() - t0) / 100 / len(lay) * 1e6, 1)
     # streamed prefill through the host path (hot experts to the GPU, tail on the CPU)
     for T in (512, 4096):
         x, ids, w = rnd(T, 9)
         l = lay[0]
         y = meth._host_path(l, x, ids, w)
-        torch.cuda.synchronize()
+        sync('s9')
         t0 = time.perf_counter()
         y = meth._host_path(l, x, ids, w)
-        torch.cuda.synchronize()
+        sync('s10')
         res[f"moe_prefill_ms_{T}"] = round((time.perf_counter() - t0) * 1e3, 1)
         # compare with the plain CPU path on a subset of rows
         sub = stock(l.exl3_cpu_idx, x[:64], ids[:64], w[:64]).to(torch.bfloat16)
@@ -253,7 +269,7 @@ def main():
     res = {}
     torch.cuda.init()
     if not a.skip_ngram:
-        ngram_test(a.model, res)
+        keep = ngram_test(a.model, res)
     if not a.skip_moe:
         moe_test(a.model, list(range(a.layers)), res)
     ok = all(res.get(k, True) for k in ("ngram_bitexact_vs_ext", "ngram_graph_eq_eager", "moe_dev_eq_stock_bitexact",

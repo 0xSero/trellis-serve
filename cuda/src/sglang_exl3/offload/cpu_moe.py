@@ -37,6 +37,7 @@ _KEY_RE = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)$")
 DEV_ROWS = int(os.environ.get("SGLANG_EXL3_CPU_MOE_DEV_ROWS", "32"))
 _TIMEOUT_NS = int(float(os.environ.get("SGLANG_EXL3_CPU_MOE_TIMEOUT_S", "120")) * 1e9)
 
+_DEBUG = os.environ.get("SGLANG_EXL3_CPU_MOE_DEBUG", "0") == "1"
 _METHODS: list = []          # every Exl3CpuMoEMethod built for this model (registration count)
 _STATE = {"host": None, "registered": 0, "dev": None}
 
@@ -49,6 +50,21 @@ def _host(model_path: str):
         cfg = types.SimpleNamespace(directory=model_path, infer_params=ip)
         _STATE["host"] = MoeCpuHost(cfg)
     return _STATE["host"]
+
+
+def _dbg_wait(tag, limit=15.0):
+    """Debug only (eager): bounded wait for the stream, then print the shared control words."""
+    from exllamav3.model import moe_cpu_host as mch
+    host = _STATE["host"]
+    ev = torch.cuda.Event()
+    ev.record()
+    t0 = time.time()
+    while not ev.query() and time.time() - t0 < limit:
+        time.sleep(0.002)
+    u = np.frombuffer(host.shm.buf, dtype=np.uint32)
+    f = mch.MOE_SLOT_FLAGS_OFFSET // 4
+    print(f"[cpu_moe dbg] {tag}: {'ok' if ev.query() else 'STUCK'} {time.time() - t0:.3f}s devseq {u[1]} abort {u[32]} "
+          f"tail {u[64]} head {u[80]} ready0 {u[f]} done0 {u[f + 128]} cons0 {u[f + 256]} host.seq {host.seq}", flush=True)
 
 
 class _DevPath:
@@ -217,10 +233,16 @@ class Exl3CpuMoEMethod(FusedMoEMethodBase):
     def _device_path(self, layer, x, ids, w):
         d = _STATE["dev"]
         x = x.contiguous()
+        if _DEBUG:
+            _dbg_wait("before issue")
         d.ext.cpu_moe_issue(x, ids.contiguous(), w.to(torch.float32).contiguous(), d.hi, d.x, d.sel, d.w, d.base,
                             d.jobs, d.job_words, d.ring, d.data_ready, layer.exl3_cpu_idx, d.counter)
+        if _DEBUG:
+            _dbg_wait("after issue")
         out = torch.empty_like(x)
         d.ext.cpu_moe_collect(out, d.out, d.ho, d.base, d.done, d.consumed, _TIMEOUT_NS)
+        if _DEBUG:
+            _dbg_wait("after collect")
         return out
 
     def _host_path(self, layer, x, ids, w):
