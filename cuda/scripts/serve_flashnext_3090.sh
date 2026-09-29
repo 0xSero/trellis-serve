@@ -2,7 +2,7 @@
 # Qwen3.8-Flash-Next EXL3 (3.05bpw_h5_ng5) on ONE RTX 3090 through SGLang + trellis-serve.
 # Default (best, 2026-09-29): routed experts in pinned host memory + a global GPU expert cache (kernel lane K05,
 #   SGLANG_EXL3_MOE_OFFLOAD=gpu_cache, 10.5 GB = 5,637 slots, prefill staging in 4 parts), token embedding in pinned host
-#   memory, EXL3 n-gram table on NVMe (pread x32) behind an 8 GB RAM row cache (SGLANG_EXL3_NGRAM_TIER=nvme; =pinned keeps all 32.6 GB in pinned RAM, +4 % prefill),
+#   memory, EXL3 n-gram table on NVMe (buffered reads x64, page cache as elastic L2) behind an 8 GB RAM row cache (SGLANG_EXL3_NGRAM_TIER=nvme; =pinned keeps all 32.6 GB in pinned RAM, +4 % prefill),
 #   fp8 e4m3 KV for 210k tokens (context 204,800), 8k prefill chunks, decode CUDA graphs.
 # Vision (images 256^2 .. 4096^2): EXL3 ViT decoded to bf16 at load (SGLANG_EXL3_VISION=1, plugin default), image
 #   preprocessing on CPU (SGLANG_EXL3_MM_FAST_CPU=1), per-image SDPA ViT attention (SGLANG_EXL3_VIT_SDPA=1), ViT MLP in

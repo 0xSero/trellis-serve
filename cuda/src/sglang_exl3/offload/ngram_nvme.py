@@ -17,11 +17,16 @@ Env (read at construction):
   SGLANG_EXL3_NGRAM_TIER        pinned (default, whole table in pinned RAM) | nvme (this module)
   SGLANG_EXL3_NGRAM_RAM_GB      RAM row-cache budget in GB (default 8 = 78.4M rows; N006: after 30M tokens of traffic the
                                 working set was 60.9M rows, so 8 GB = infinite-cache hit rate; 4 GB loses ~4-5 pt)
-  SGLANG_EXL3_NGRAM_IO          pread (default: O_DIRECT, 32-thread pool, ~290k IOPS on the dm-crypt 990 Pro) |
-                                aio (O_DIRECT + io_submit, one issuer, ~185k IOPS) | buffered (page cache; ~2.7M rows/s
-                                when the file is cached, but uses up to 32.6 GB of reclaimable page cache)
+  SGLANG_EXL3_NGRAM_IO          buffered (default: pread through the page cache with POSIX_FADV_RANDOM, 64 threads;
+                                ~520-560k cold rows/s on the dm-crypt 990 Pro, ~1.8M rows/s from cached pages; the
+                                page cache keeps up to the 32.6 GB file as reclaimable memory, N020/N021/N042) |
+                                pread (O_DIRECT, fixed RAM use, ~285k rows/s at >= 32 threads) | mmap (MADV_RANDOM,
+                                ~= buffered) | aio (O_DIRECT io_submit, ~180k rows/s)
   SGLANG_EXL3_NGRAM_POLICY      clock (default) | gclock (2-bit frequency CLOCK) | cold (new rows inserted unreferenced)
-  SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  pread threads (32)
+  SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  read threads (64)
+  SGLANG_EXL3_NGRAM_PC_DROP     buffered/mmap: evict read spans from the page cache (default 0; loses the speed-up)
+  SGLANG_EXL3_NGRAM_HINT_ARRIVAL warm a request's first chunk when it is queued (default 1; neutral on an idle server)
+  SGLANG_EXL3_NGRAM_HUGEPAGE    MADV_HUGEPAGE on the cache (default 0: direct compaction stalled init for 335 s once)
   SGLANG_EXL3_NGRAM_MAX_TOKENS  largest forward (tokens) one lookup may carry (default 32768 -> 524,288 ids)
   SGLANG_EXL3_NGRAM_MAX_RUN     largest coalesced read in bytes (default 65536)
   SGLANG_EXL3_NGRAM_MERGE_GAP   merge two runs if the gap is <= this many bytes (default 0: touching blocks only)
@@ -119,7 +124,7 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.prefix = t["prefix"]
         self.row_bytes = self.words * 2
         ram_gb = float(ram_gb if ram_gb is not None else _env("SGLANG_EXL3_NGRAM_RAM_GB", 8.0, float))
-        io = io or _env("SGLANG_EXL3_NGRAM_IO", "pread")
+        io = io or _env("SGLANG_EXL3_NGRAM_IO", "buffered")
         backend = {"aio": 0, "pread": 1, "buffered": 2, "mmap": 3}[io]
         max_tokens = int(max_tokens or _env("SGLANG_EXL3_NGRAM_MAX_TOKENS", 32768, int))
         aux_names = ("head_bias", "head_offsets", "head_vocab_sizes", "layer_multipliers")
@@ -133,7 +138,7 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.ext = load_ext()
         t0 = time.time()
         self.store = self.ext.RowStore(t["path"], t["row0"], t["rows"], t["offs"], self.row_bytes, nslots, backend,
-                                       _env("SGLANG_EXL3_NGRAM_THREADS", 32, int), _env("SGLANG_EXL3_NGRAM_QD", 128, int),
+                                       _env("SGLANG_EXL3_NGRAM_THREADS", 64, int), _env("SGLANG_EXL3_NGRAM_QD", 128, int),
                                        _env("SGLANG_EXL3_NGRAM_MAX_RUN", 65536, int),
                                        _env("SGLANG_EXL3_NGRAM_MERGE_GAP", 0, int), self.cap)
         self.nslots = nslots
