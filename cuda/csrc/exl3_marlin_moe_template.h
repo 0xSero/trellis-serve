@@ -319,7 +319,16 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
     // Had128 -> * svh to the finished fp16 rows while they sit in shared memory (svh = `b_bias_ptr`, fp16
     // [num_experts, prob_n], advanced per expert like Marlin's bias; needs thread_n % 128 == 0); bit 1: store the
     // result as bf16 bits. 0 = plain GEMM.
-    int out_flags) {
+    int out_flags,
+    // EXL3 offload: per-expert POINTER TABLE (nullptr = stacked [E, ...] B / svh as before). When set, expert e's
+    // B is read from b_ptrs[e * ptr_stride] and its svh from s_ptrs[e * ptr_stride] (int64 addresses: device memory
+    // or UVA-mapped pinned host memory = zero-copy over PCIe). The table is read on the device at every moe block,
+    // so rewriting it in place between replays keeps captured CUDA graphs valid.
+    const int64_t* __restrict__ b_ptrs, const int64_t* __restrict__ s_ptrs, int ptr_stride, int ptr_rows,
+    // EXL3 offload, fused admission: wb_ptrs[e * ptr_stride] = where to ALSO store expert e's B (a GPU cache slot),
+    // 0 = no write-back. Every B tile a block stages in shared memory is written out once, so a zero-copy miss lands
+    // in its slot without a second PCIe read. nullptr = off.
+    const int64_t* __restrict__ wb_ptrs) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -491,6 +500,7 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
   int64_t expert_id = 0;  // use int64 to avoid computation result overflow
   int old_expert_id = 0;
   int64_t B_expert_off = 0;
+  int4* WB = nullptr;  // EXL3 fused admission: write-back base of the current expert's B (nullptr = none)
 
   float* sh_a_s = reinterpret_cast<float*>(sh);
   int4* sh_block_sorted_ids_int4 = sh + (is_a_8bit ? (4 * thread_m_blocks) : 0);
@@ -607,6 +617,15 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
       global_scale_f32 = global_scale_ptr[expert_id];
     }
 
+    if (b_ptrs != nullptr) {  // EXL3 offload: pointer table (B_expert_off stays 0, B itself moves)
+      // a block of an expert outside the table (-1, or the sentinel E of an align run without ignore_invalid_expert):
+      // its rows are dropped slots (moe_combine skips them); read a valid expert instead of a bogus address
+      const int64_t e_row = (expert_id < 0 || expert_id >= ptr_rows) ? 0 : expert_id * ptr_stride;
+      B = reinterpret_cast<const int4*>(b_ptrs[e_row]);
+      if (wb_ptrs != nullptr)
+        WB = (expert_id < 0 || expert_id >= ptr_rows) ? nullptr : reinterpret_cast<int4*>(wb_ptrs[e_row]);
+      if (out_flags & 1) b_bias_ptr = reinterpret_cast<const int4*>(s_ptrs[e_row]);
+    } else
     B_expert_off = exl3_k3 ? expert_id * (prob_k / 16) * (prob_n * 3 / 8)
                            : expert_id * prob_n * prob_k / (pack_factor * 4);
     scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
@@ -616,7 +635,7 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
     if constexpr (has_act_order) {
       g_idx += (expert_id - old_expert_id) * prob_k;
     }
-    if (has_bias || (out_flags & 1)) {  // EXL3: svh [num_experts, prob_n] travels in b_bias_ptr
+    if ((has_bias || (out_flags & 1)) && b_ptrs == nullptr) {  // EXL3: svh [num_experts, prob_n] travels in b_bias_ptr
       b_bias_ptr += (expert_id - old_expert_id) * b_bias_expert_stride;
     }
 
@@ -1046,10 +1065,48 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
       }
     }
   };
+  // EXL3 fused admission: per pipeline stage, where its staged B tile goes (nullptr = nothing pending) and the B
+  // offset it was read from. A stage is written out by the threads that staged it (own cp.async, already waited on)
+  // right before the stage is refilled, and all pending stages at the end of a slice.
+  int4* wb_dst[stages];
+  int wb_rd[stages];
+  #pragma unroll
+  for (int i = 0; i < stages; i++) wb_dst[i] = nullptr;
+  auto wb_flush = [&](int pipe) {
+    if (wb_dst[pipe] == nullptr) return;
+    int4* dst = wb_dst[pipe];
+    const int rd = wb_rd[pipe];
+    const int4* stage = sh_b + b_sh_stage * pipe;
+    if constexpr (exl3_k3) {
+  #pragma unroll
+      for (int i = 0; i < b_sh_cp_iters; i++) {
+        int s = threads * i + threadIdx.x;
+        if (s < b_sh_stage) {
+          int kk = s / b_sh_stride;
+          int col = s - kk * b_sh_stride;
+          dst[rd + kk * b_gl_stride + col] = stage[s];
+        }
+      }
+    } else {
+  #pragma unroll
+      for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
+        constexpr int count = div_ceil(b_sh_stride, threads);
+        int b_gl_idx = rd + (i % count) * threads + b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
+        dst[b_gl_idx] = stage[threads * i + threadIdx.x];
+      }
+    }
+    wb_dst[pipe] = nullptr;
+  };
+
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
   auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
     if (pred) {
+      if (wb_ptrs != nullptr) {  // EXL3 fused admission
+        wb_flush(pipe);
+        wb_dst[pipe] = WB;
+        wb_rd[pipe] = b_gl_rd;
+      }
       int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe;
       // EXL3: input slab of the shard this column slice belongs to (offset set in init_slice)
       const int4* A_sh = A + a_sh_off;
@@ -2189,6 +2246,12 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
     // While this pattern may not be the most readable, other ways of writing
     // the loop seemed to noticeably worse performance after compilation.
     if (slice_iters == 0) {
+      if (wb_ptrs != nullptr) {  // EXL3 fused admission: write out the stages still pending before smem is reused
+        cp_async_wait<0>();
+  #pragma unroll
+        for (int i = 0; i < stages; i++) wb_flush(i);
+        __syncthreads();
+      }
       // convert fp16 accum to fp32 for reduction
       if constexpr (use_fp16_accum) {
   #pragma unroll
