@@ -127,7 +127,10 @@ static void* host_alloc(size_t bytes, bool hugepage)
 {
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) throw std::runtime_error("ngram_nvme: mmap failed");
-    if (hugepage) madvise(p, bytes, MADV_HUGEPAGE);
+    // MADV_HUGEPAGE only on request: with THP defrag=madvise it makes page faults compact memory synchronously, which
+    // took 335 s for the 8 GB slab on a fragmented, busy box (N030) vs 0.8 s on a fresh one
+    if (hugepage && getenv("SGLANG_EXL3_NGRAM_HUGEPAGE") && getenv("SGLANG_EXL3_NGRAM_HUGEPAGE")[0] == '1')
+        madvise(p, bytes, MADV_HUGEPAGE);
     return p;
 }
 
@@ -173,8 +176,7 @@ public:
         std::fill(slot_row_, slot_row_ + nslots_, -1);
         // slab: page-locked + mapped (registered by the caller from Python), 64 B tail pad for the kernel's loads
         slab_bytes_ = ((size_t) nslots_ * row_bytes_ + 4095 + 64) & ~(size_t) 4095;
-        slab_ = (uint8_t*) host_alloc(slab_bytes_, true);
-        memset(slab_, 0, slab_bytes_);
+        slab_ = (uint8_t*) host_alloc(slab_bytes_, true);   // anonymous mmap: already zero, no memset
         // mapped request / response / control
         io_bytes_ = (((size_t) cap_ * 8 + 4095) & ~(size_t) 4095);
         req_ = (int64_t*) host_alloc(io_bytes_, false);
