@@ -33,6 +33,8 @@ def activate() -> None:
     _patch_decode_token_ids_logprobs()
     from .sglang_glue import qsa_fp8e4m3
     qsa_fp8e4m3.install()                    # e4m3 KV pool readable by the QSA kernels on sm_86
+    from .sglang_glue import qsa_qkv
+    qsa_qkv.install()                        # SGLANG_EXL3_KV_BITS=4|3: exllamav3-quantized QSA KV (off by default)
     if os.environ.get("SGLANG_EXL3_NGRAM_HOST", "1") == "1":
         # Qwen3.8-Flash-Next EXL3 n-gram table: pinned host memory + zero-copy gather/decode (offload/ngram_host.py);
         # a no-op for checkpoints without ngram_embedding.safetensors
