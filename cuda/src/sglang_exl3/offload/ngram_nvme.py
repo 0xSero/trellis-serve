@@ -294,7 +294,8 @@ def install_prefill_hints() -> None:
                 if tabs:
                     tab = tabs[0]
                     ids = list(req.origin_input_ids)
-                    start = len(req.fill_ids)
+                    # SGLang 0.5.20: Req.get_fill_ids() (up to the scheduled chunk's end); older: Req.fill_ids
+                    start = len(req.get_fill_ids()) if hasattr(req, "get_fill_ids") else len(req.fill_ids)
                     size = int(getattr(self, "chunked_prefill_size", 0) or 8192)
                     if 0 < start < len(ids):
                         eos = getattr(tab, "eos_token_id", None)
