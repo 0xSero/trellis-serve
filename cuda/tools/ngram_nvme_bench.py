@@ -174,6 +174,8 @@ def main():
     ap.add_argument("--policy", type=int, default=0, help="0 CLOCK, 1 GCLOCK (2-bit), 2 CLOCK cold insertion")
     ap.add_argument("--prefill-tps", type=float, default=2500.0)
     ap.add_argument("--corpus-tokens", type=int, default=20_000_000)
+    ap.add_argument("--corpus-cache", default="")
+    ap.add_argument("--drop", action="store_true", help="sweep: drop the n-gram file from the page cache first")
     a = ap.parse_args()
     os.environ["SGLANG_EXL3_NGRAM_POLICY"] = ["clock", "gclock", "cold"][a.policy]
     os.makedirs(a.out, exist_ok=True)
@@ -220,33 +222,41 @@ def main():
         tab.release()
     elif a.mode == "hitrate":
         # dry cache simulation (no reads): warm-up traffic from a text/code corpus, then the K02 streams
-        from tokenizers import Tokenizer
-        tok = Tokenizer.from_file(os.path.join(a.model, "tokenizer.json"))
-        files = []
-        for d in filter(None, a.corpus.split(",")):
-            for root, _, fs in os.walk(d):
-                for f in sorted(fs):
-                    if f.endswith((".py", ".md", ".txt", ".rst")):
-                        files.append(os.path.join(root, f))
-        rng = np.random.default_rng(0)
-        rng.shuffle(files)
-        tab0 = make_table(a.model, 0.03, a.io, 16384)
-        docs, ntok, B = [], 0, 256
-        for i in range(0, len(files), B):
-            texts = []
-            for f in files[i:i + B]:
-                try:
-                    texts.append(open(f, errors="ignore").read()[:400000])
-                except OSError:
-                    pass
-            for e in tok.encode_batch(texts, add_special_tokens=False):
-                if len(e.ids) < 16:
-                    continue
-                docs.append(np.asarray(e.ids, dtype=np.int32))
-                ntok += len(e.ids)
-            if ntok >= a.corpus_tokens:
-                break
-        tab0.release()
+        cache_f = a.corpus_cache
+        if cache_f and os.path.exists(cache_f):
+            z = np.load(cache_f)
+            flat, offs = z["tokens"], z["offs"]
+            docs = [flat[offs[i]:offs[i + 1]] for i in range(len(offs) - 1)]
+            ntok = int(offs[-1])
+        else:
+            from tokenizers import Tokenizer
+            tok = Tokenizer.from_file(os.path.join(a.model, "tokenizer.json"))
+            files = []
+            for d in filter(None, a.corpus.split(",")):
+                for root, _, fs in os.walk(d):
+                    for f in sorted(fs):
+                        if f.endswith((".py", ".md", ".txt", ".rst")):
+                            files.append(os.path.join(root, f))
+            rng = np.random.default_rng(0)
+            rng.shuffle(files)
+            docs, ntok, B = [], 0, 256
+            for i in range(0, len(files), B):
+                texts = []
+                for f in files[i:i + B]:
+                    try:
+                        texts.append(open(f, errors="ignore").read()[:400000])
+                    except OSError:
+                        pass
+                for e in tok.encode_batch(texts, add_special_tokens=False):
+                    if len(e.ids) < 16:
+                        continue
+                    docs.append(np.asarray(e.ids, dtype=np.int32))
+                    ntok += len(e.ids)
+                if ntok >= a.corpus_tokens:
+                    break
+            if cache_f:
+                offs = np.cumsum([0] + [len(d) for d in docs])
+                np.savez(cache_f, tokens=np.concatenate(docs), offs=offs)
         print("corpus", len(docs), "docs", ntok, "tokens", flush=True)
         out = []
         for gb in [float(x) for x in a.budgets.split(",")]:
@@ -364,6 +374,8 @@ def main():
         for chunk in [int(x) for x in a.chunks.split(",")]:
             for gb in [float(x) for x in a.budgets.split(",")]:
                 tab = make_table(a.model, gb, a.io, chunk)
+                if a.drop:
+                    tab.store.drop_file_cache()
                 for rep in range(a.repeat):
                     r = replay(tab, streams, chunk)
                     s = summarize(r, chunk); s.update(budget_gb=gb, rep=rep, io=a.io)
