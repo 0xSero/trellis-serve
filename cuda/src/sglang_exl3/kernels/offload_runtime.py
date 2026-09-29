@@ -42,6 +42,10 @@ class OffloadRuntime:
         # layer buffers, 1.91 GB; P = 4: 0.48 GB), the grouped kernel runs once per part (K06b)
         if self.E % staging_parts:
             raise ValueError("staging_parts must divide the expert count")
+        import os as _os
+        # K07: fused decode prologue (SGLANG_EXL3_OFFLOAD_FUSED=1): one launch replaces id clean + align + cache step +
+        # commit per layer at decode sizes
+        self.fused_decode = _os.environ.get("SGLANG_EXL3_OFFLOAD_FUSED", "0") == "1"
         self.P = staging_parts
         self.subchunk = prefill_subchunk     # tokens per GEMM pass inside a staged layer (bounds activation memory)
         self.part_e = self.E // staging_parts
@@ -68,6 +72,11 @@ class OffloadRuntime:
         T = x.shape[0]
         if T == 0:
             return torch.empty_like(x)
+        if self.fused_decode and force != "prefill" and T * topk_ids.shape[1] <= 1024 and \
+                marlin_moe.moe_block_size(T, topk_ids.shape[1], self.E) == 8 and routing is None and \
+                (force == "decode" or torch.cuda.is_current_stream_capturing() or T < self.prefill_min_tokens):
+            w = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
+            return self.cache.run_fused(layer, x.contiguous(), w.contiguous(), topk_ids, self.cb)
         ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
         # SGLang masks padded rows of a graph batch to -1 (undefined in the align op): map them to the drop sentinel E
         ids = torch.where(ids < 0, torch.full_like(ids, self.E), ids).contiguous()
