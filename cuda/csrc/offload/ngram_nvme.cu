@@ -25,6 +25,7 @@
 #include <linux/aio_abi.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <immintrin.h>
@@ -126,7 +127,10 @@ static void* host_alloc(size_t bytes, bool hugepage)
 {
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) throw std::runtime_error("ngram_nvme: mmap failed");
-    if (hugepage) madvise(p, bytes, MADV_HUGEPAGE);
+    // MADV_HUGEPAGE only on request: with THP defrag=madvise it makes page faults compact memory synchronously, which
+    // took 335 s for the 8 GB slab on a fragmented, busy box (N030) vs 0.8 s on a fresh one
+    if (hugepage && getenv("SGLANG_EXL3_NGRAM_HUGEPAGE") && getenv("SGLANG_EXL3_NGRAM_HUGEPAGE")[0] == '1')
+        madvise(p, bytes, MADV_HUGEPAGE);
     return p;
 }
 
@@ -136,7 +140,8 @@ struct Extent { int64_t row0, rows, file_off; };
 struct Miss { int64_t off; int64_t slot; };
 struct Run { int64_t off, len; int32_t m0, m1; };   // aligned file span, misses [m0, m1)
 
-enum Backend { AIO = 0, PREAD = 1, BUFFERED = 2 };
+enum Backend { AIO = 0, PREAD = 1, BUFFERED = 2, MMAP = 3 };
+enum Policy { CLOCK = 0, GCLOCK = 1, CLOCK_COLD = 2 };
 
 class RowStore
 {
@@ -149,19 +154,33 @@ public:
     {
         for (size_t i = 0; i < row0.size(); ++i) ext_.push_back({row0[i], rows[i], file_off[i]});
         num_rows_ = ext_.back().row0 + ext_.back().rows;
-        fd_ = open(path.c_str(), O_RDONLY | (backend_ == BUFFERED ? 0 : O_DIRECT));
+        bool direct = backend_ == AIO || backend_ == PREAD;
+        path_ = path;
+        fd_ = open(path.c_str(), O_RDONLY | (direct ? O_DIRECT : 0));
         if (fd_ < 0) throw std::runtime_error("ngram_nvme: open " + path + " failed: " + strerror(errno));
-        if (backend_ == BUFFERED) posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+        if (!direct) posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+        if (backend_ == MMAP)
+        {
+            struct stat stt;
+            fstat(fd_, &stt);
+            fmap_bytes_ = (size_t) stt.st_size;
+            fmap_ = (const uint8_t*) mmap(nullptr, fmap_bytes_, PROT_READ, MAP_SHARED, fd_, 0);
+            if (fmap_ == MAP_FAILED) throw std::runtime_error("ngram_nvme: mmap file failed");
+            madvise((void*) fmap_, fmap_bytes_, MADV_RANDOM);
+        }
         if (nslots_ < cap_) throw std::runtime_error("ngram_nvme: cache smaller than one request (slots < max ids)");
         map_ = (int32_t*) host_alloc((size_t) num_rows_ * 4, true);          // row -> slot + 1, 0 = absent
         slot_row_ = (int32_t*) host_alloc((size_t) nslots_ * 4, true);
         ref_ = (uint8_t*) host_alloc((size_t) nslots_, true);
         epoch_ = (uint32_t*) host_alloc((size_t) nslots_ * 4, true);
+        // last service request that handed the slot to the GPU: protected until the next service request (a warm
+        // hint re-tagging epoch_ must not unprotect a slot the GPU may still be reading; N036 panel KL 0.00107)
+        svcmark_ = (uint32_t*) host_alloc((size_t) nslots_ * 4, true);
+        std::fill(svcmark_, svcmark_ + nslots_, 0xffffffffu);
         std::fill(slot_row_, slot_row_ + nslots_, -1);
         // slab: page-locked + mapped (registered by the caller from Python), 64 B tail pad for the kernel's loads
         slab_bytes_ = ((size_t) nslots_ * row_bytes_ + 4095 + 64) & ~(size_t) 4095;
-        slab_ = (uint8_t*) host_alloc(slab_bytes_, true);
-        memset(slab_, 0, slab_bytes_);
+        slab_ = (uint8_t*) host_alloc(slab_bytes_, true);   // anonymous mmap: already zero, no memset
         // mapped request / response / control
         io_bytes_ = (((size_t) cap_ * 8 + 4095) & ~(size_t) 4095);
         req_ = (int64_t*) host_alloc(io_bytes_, false);
@@ -194,6 +213,7 @@ public:
         for (auto& t : pool_) t.join();
         pool_.clear();
         if (aio_ctx_) { syscall(SYS_io_destroy, aio_ctx_); aio_ctx_ = 0; }
+        if (fmap_) { munmap((void*) fmap_, fmap_bytes_); fmap_ = nullptr; }
         if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
         // host memory is left mapped: the caller unregisters the slab/io buffers first, then calls release_memory()
     }
@@ -205,6 +225,7 @@ public:
         un(slot_row_, (size_t) nslots_ * 4); slot_row_ = nullptr;
         un(ref_, (size_t) nslots_); ref_ = nullptr;
         un(epoch_, (size_t) nslots_ * 4); epoch_ = nullptr;
+        un(svcmark_, (size_t) nslots_ * 4); svcmark_ = nullptr;
         un(slab_, slab_bytes_); slab_ = nullptr;
         un(req_, io_bytes_); req_ = nullptr;
         un(resp_, io_bytes_); resp_ = nullptr;
@@ -267,6 +288,18 @@ public:
     void set_warm_chunk(int64_t c) { warm_chunk_ = std::max<int64_t>(16, c); }
     // dry run: cache bookkeeping only, no reads (hit-rate simulation on large corpora)
     void set_dry(bool d) { dry_ = d; }
+    void set_policy(int64_t p) { policy_ = (int) p; }
+    // buffered/mmap: drop each read span from the page cache right after copying it (no page-cache growth)
+    void set_pc_drop(bool d) { pc_drop_ = d; }
+    // evict this file's clean pages from the page cache (per-file POSIX_FADV_DONTNEED; nothing system-wide)
+    int64_t drop_file_cache()
+    {
+        int f = open(path_.c_str(), O_RDONLY);
+        if (f < 0) return -1;
+        int r = posix_fadvise(f, 0, 0, POSIX_FADV_DONTNEED);
+        ::close(f);
+        return r;
+    }
 
     // copy the raw bytes of the rows behind slots (verification)
     void read_slots(torch::Tensor slots, torch::Tensor out)
@@ -362,8 +395,8 @@ private:
             int64_t s = hand_;
             hand_ = hand_ + 1 == nslots_ ? 0 : hand_ + 1;
             if (slot_row_[s] < 0) { st_resident_++; return s; }
-            if (epoch_[s] == cur_epoch_ || epoch_[s] == svc_epoch_) { if (++spins > 3 * nslots_) throw std::runtime_error("ngram_nvme: all slots pinned"); continue; }
-            if (ref_[s]) { ref_[s] = 0; continue; }
+            if (epoch_[s] == cur_epoch_ || svcmark_[s] == svc_epoch_) { if (++spins > 3 * nslots_) throw std::runtime_error("ngram_nvme: all slots pinned"); continue; }
+            if (ref_[s]) { ref_[s] = policy_ == GCLOCK ? ref_[s] - 1 : 0; continue; }
             map_[slot_row_[s]] = 0;
             return s;
         }
@@ -384,8 +417,12 @@ private:
             if (s1)
             {
                 int64_t s = s1 - 1;
-                if (epoch_[s] != cur_epoch_) { uniq++; hits++; epoch_[s] = cur_epoch_; }   // else: dup in this request
-                ref_[s] = 1;
+                if (service) svcmark_[s] = cur_epoch_;
+                if (epoch_[s] != cur_epoch_)   // else: dup in this request
+                {
+                    uniq++; hits++; epoch_[s] = cur_epoch_;
+                    ref_[s] = policy_ == GCLOCK ? (uint8_t) std::min(3, ref_[s] + 1) : 1;
+                }
                 slots[i] = s;
             }
             else
@@ -393,8 +430,9 @@ private:
                 int64_t s = evict_one();
                 map_[r] = (int32_t) (s + 1);
                 slot_row_[s] = (int32_t) r;
-                ref_[s] = 1;
+                ref_[s] = policy_ == CLOCK_COLD ? 0 : 1;
                 epoch_[s] = cur_epoch_;
+                if (service) svcmark_[s] = cur_epoch_;
                 slots[i] = s;
                 misses_.push_back({file_offset(r), s});
                 uniq++;
@@ -553,7 +591,8 @@ private:
             int64_t n;
             {
                 std::unique_lock<std::mutex> g(pool_mu_);
-                pool_cv_.wait(g, [&] { return pool_quit_ || pool_gen_ != seen; });
+                // only the first pool_want_ workers take part in a generation (small requests wake few threads)
+                pool_cv_.wait(g, [&] { return pool_quit_ || (pool_gen_ != seen && tid < pool_want_); });
                 if (pool_quit_) return;
                 seen = pool_gen_;
                 n = pool_n_;
@@ -570,8 +609,23 @@ private:
         {
             int64_t i = pool_next_.fetch_add(1);
             if (i >= n) break;
-            read_one(runs_[i], buf);
-            scatter_run(runs_[i], buf);
+            if (backend_ == MMAP)
+            {
+                const Run& r = runs_[i];
+                for (int32_t m = r.m0; m < r.m1; ++m)
+                    memcpy(slab_ + misses_[m].slot * row_bytes_, fmap_ + misses_[m].off, row_bytes_);
+                if (pc_drop_)
+                {
+                    madvise((void*) (fmap_ + r.off), (size_t) r.len, MADV_DONTNEED);
+                    posix_fadvise(fd_, r.off, r.len, POSIX_FADV_DONTNEED);
+                }
+            }
+            else
+            {
+                read_one(runs_[i], buf);
+                scatter_run(runs_[i], buf);
+                if (pc_drop_ && backend_ == BUFFERED) posix_fadvise(fd_, runs_[i].off, runs_[i].len, POSIX_FADV_DONTNEED);
+            }
             pool_done_.fetch_add(1);
         }
     }
@@ -586,7 +640,8 @@ private:
             {
                 std::lock_guard<std::mutex> g(pool_mu_);
                 pool_n_ = n;
-                pool_active_.store(threads_ - 1);
+                pool_want_ = (int) std::min<int64_t>(threads_, n);
+                pool_active_.store(pool_want_ - 1);
                 pool_gen_++;
             }
             pool_cv_.notify_all();
@@ -633,6 +688,11 @@ private:
     int64_t warm_chunk_ = 256;
     std::atomic<bool> svc_waiting_{false};
     bool dry_ = false;
+    int policy_ = CLOCK;
+    bool pc_drop_ = false;
+    std::string path_;
+    const uint8_t* fmap_ = nullptr;
+    size_t fmap_bytes_ = 0;
     std::vector<Extent> ext_;
     int64_t num_rows_ = 0;
     int fd_ = -1;
@@ -642,6 +702,7 @@ private:
     int32_t* slot_row_ = nullptr;
     uint8_t* ref_ = nullptr;
     uint32_t* epoch_ = nullptr;
+    uint32_t* svcmark_ = nullptr;
     uint32_t cur_epoch_ = 0, svc_epoch_ = 0;
     int64_t hand_ = 0;
     uint8_t* slab_ = nullptr;
@@ -665,6 +726,7 @@ private:
     std::atomic<int64_t> pool_next_{0}, pool_done_{0};
     std::atomic<int> pool_active_{0};
     int64_t pool_n_ = 0;
+    int pool_want_ = 0;
     // service
     std::thread svc_;
     std::atomic<bool> svc_quit_{false};
@@ -779,6 +841,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("warm", &RowStore::warm_tensor, py::call_guard<py::gil_scoped_release>())
         .def("set_warm_chunk", &RowStore::set_warm_chunk)
         .def("set_dry", &RowStore::set_dry)
+        .def("set_policy", &RowStore::set_policy)
+        .def("set_pc_drop", &RowStore::set_pc_drop)
+        .def("drop_file_cache", &RowStore::drop_file_cache)
         .def("read_slots", &RowStore::read_slots)
         .def("start_service", &RowStore::start_service)
         .def("stop_service", &RowStore::stop_service, py::call_guard<py::gil_scoped_release>())

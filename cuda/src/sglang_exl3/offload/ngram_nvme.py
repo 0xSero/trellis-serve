@@ -17,10 +17,17 @@ Env (read at construction):
   SGLANG_EXL3_NGRAM_TIER        pinned (default, whole table in pinned RAM) | nvme (this module)
   SGLANG_EXL3_NGRAM_RAM_GB      RAM row-cache budget in GB (default 8 = 78.4M rows; N006: after 30M tokens of traffic the
                                 working set was 60.9M rows, so 8 GB = infinite-cache hit rate; 4 GB loses ~4-5 pt)
-  SGLANG_EXL3_NGRAM_IO          pread (default: O_DIRECT, 32-thread pool, ~290k IOPS on the dm-crypt 990 Pro) |
-                                aio (O_DIRECT + io_submit, one issuer, ~185k IOPS) | buffered (page cache; ~2.7M rows/s
-                                when the file is cached, but uses up to 32.6 GB of reclaimable page cache)
-  SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  pread threads (32)
+  SGLANG_EXL3_NGRAM_IO          buffered (default: pread through the page cache with POSIX_FADV_RANDOM, 64 threads;
+                                ~520-560k cold rows/s on the dm-crypt 990 Pro, ~1.8M rows/s from cached pages; the
+                                page cache keeps up to the 32.6 GB file as reclaimable memory, N020/N021/N042) |
+                                pread (O_DIRECT, fixed RAM use, ~285k rows/s at >= 32 threads) | mmap (MADV_RANDOM,
+                                ~= buffered) | aio (O_DIRECT io_submit, ~180k rows/s)
+  SGLANG_EXL3_NGRAM_POLICY      cold (default: CLOCK, new rows inserted unreferenced; N024 +0.5-0.8 pt hit rate at 4-12 GB)
+                                | clock | gclock (2-bit frequency CLOCK, == cold)
+  SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  read threads (64)
+  SGLANG_EXL3_NGRAM_PC_DROP     buffered/mmap: evict read spans from the page cache (default 0; loses the speed-up)
+  SGLANG_EXL3_NGRAM_HINT_ARRIVAL warm a request's first chunk when it is queued (default 1; neutral on an idle server)
+  SGLANG_EXL3_NGRAM_HUGEPAGE    MADV_HUGEPAGE on the cache (default 0: direct compaction stalled init for 335 s once)
   SGLANG_EXL3_NGRAM_MAX_TOKENS  largest forward (tokens) one lookup may carry (default 32768 -> 524,288 ids)
   SGLANG_EXL3_NGRAM_MAX_RUN     largest coalesced read in bytes (default 65536)
   SGLANG_EXL3_NGRAM_MERGE_GAP   merge two runs if the gap is <= this many bytes (default 0: touching blocks only)
@@ -118,8 +125,8 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.prefix = t["prefix"]
         self.row_bytes = self.words * 2
         ram_gb = float(ram_gb if ram_gb is not None else _env("SGLANG_EXL3_NGRAM_RAM_GB", 8.0, float))
-        io = io or _env("SGLANG_EXL3_NGRAM_IO", "pread")
-        backend = {"aio": 0, "pread": 1, "buffered": 2}[io]
+        io = io or _env("SGLANG_EXL3_NGRAM_IO", "buffered")
+        backend = {"aio": 0, "pread": 1, "buffered": 2, "mmap": 3}[io]
         max_tokens = int(max_tokens or _env("SGLANG_EXL3_NGRAM_MAX_TOKENS", 32768, int))
         aux_names = ("head_bias", "head_offsets", "head_vocab_sizes", "layer_multipliers")
         aux = {n: _read_small(t["path"], t["base"], t["hdr"][f"{self.prefix}.{n}"]) for n in aux_names
@@ -132,10 +139,13 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.ext = load_ext()
         t0 = time.time()
         self.store = self.ext.RowStore(t["path"], t["row0"], t["rows"], t["offs"], self.row_bytes, nslots, backend,
-                                       _env("SGLANG_EXL3_NGRAM_THREADS", 32, int), _env("SGLANG_EXL3_NGRAM_QD", 128, int),
+                                       _env("SGLANG_EXL3_NGRAM_THREADS", 64, int), _env("SGLANG_EXL3_NGRAM_QD", 128, int),
                                        _env("SGLANG_EXL3_NGRAM_MAX_RUN", 65536, int),
                                        _env("SGLANG_EXL3_NGRAM_MERGE_GAP", 0, int), self.cap)
         self.nslots = nslots
+        pol = _env("SGLANG_EXL3_NGRAM_POLICY", "cold")
+        self.store.set_policy({"clock": 0, "gclock": 1, "cold": 2}[pol])
+        self.store.set_pc_drop(_env("SGLANG_EXL3_NGRAM_PC_DROP", "0") == "1")
         self.file_hash = {k: aux[k].long() for k in ("head_offsets", "head_vocab_sizes", "layer_multipliers")}
         self.embedding_dim = 160
         self.num_embeddings = self.num_rows
@@ -332,3 +342,29 @@ def install_prefill_hints() -> None:
 
     cls.get_new_batch_prefill = get_new_batch_prefill
     cls._exl3_ngram_hint = True
+
+    # request arrival: warm the first chunk as soon as the tokenized request is queued (before scheduling)
+    if os.environ.get("SGLANG_EXL3_NGRAM_HINT_ARRIVAL", "1") != "0" and hasattr(cls, "_add_request_to_queue"):
+        orig_add = cls._add_request_to_queue
+
+        def _add_request_to_queue(self, req, *a, **k):
+            out = orig_add(self, req, *a, **k)
+            try:
+                if not getattr(req, "_exl3_ngram_hinted", False):
+                    from .ngram_host import _TABLES
+                    tabs = [t for t in _TABLES.values() if isinstance(t, Exl3NgramNvmeTable)]
+                    if tabs:
+                        tab = tabs[0]
+                        req._exl3_ngram_hinted = True
+                        size = int(getattr(self, "chunked_prefill_size", 0) or 8192)
+                        ids = list(req.origin_input_ids)[:size]
+                        if ids:
+                            eos = getattr(tab, "eos_token_id", None)
+                            tab.hint_tokens(ids, history=[eos, eos], eos=eos)
+            except Exception as e:
+                if not _HINT_WARNED[0]:
+                    _HINT_WARNED[0] = True
+                    logger.warning("n-gram NVMe arrival hint disabled after error: %r", e)
+            return out
+
+        cls._add_request_to_queue = _add_request_to_queue
