@@ -5,7 +5,7 @@
 # Foreground (run it under bench/gpu1_run.sh in tmux so the GPU lock is held exactly as long as the server lives):
 #   serve_flashnext_3090.sh <run dir> [extra sglang args...]
 # Env: GPU (1), PORT (30100), IMAGE (sglang-exl3:dev), NAME (ft-int-serve), MODEL (dir under ~/models),
-#      CTX (262144), MEMFRAC (0.80), CHUNK (16384), THREADS (24), GRAPH_BS (8), KVDTYPE (fp8_e5m2), MAMBA (16), MAXTOK (270336 KV tokens),
+#      CTX (262144), MEMFRAC (0.80), CHUNK (16384), THREADS (24), GRAPH_BS (8), KVDTYPE (fp8_e4m3), MAMBA (16), MAXTOK (270336 KV tokens),
 #      DOCKER_ENV (extra "-e K=V ..." docker args); SGLANG_* / EXL3_* are forwarded.
 set -uo pipefail
 RUN=${1:?run dir}; shift; mkdir -p "$RUN"
@@ -15,7 +15,7 @@ TS=${TS:-$HOME/freetoken-exl3/integration/trellis-serve}
 INNER="pip install -q --no-deps --no-build-isolation -e /opt/trellis-serve/core -e /opt/trellis-serve/cuda >/tmp/pip.log 2>&1 || cat /tmp/pip.log; \
 exec python3 -m sglang.launch_server --model-path /models/$MODEL --quantization exl3 --trust-remote-code \
  --host 0.0.0.0 --port $PORT --served-model-name flashnext --disable-shared-experts-fusion \
- --kv-cache-dtype ${KVDTYPE:-fp8_e5m2} --context-length ${CTX:-262144} --mem-fraction-static ${MEMFRAC:-0.80} \
+ --kv-cache-dtype ${KVDTYPE:-fp8_e4m3} --context-length ${CTX:-262144} --mem-fraction-static ${MEMFRAC:-0.80} \
  --chunked-prefill-size ${CHUNK:-16384} --max-running-requests ${MAXREQ:-4} --cuda-graph-max-bs-decode ${GRAPH_BS:-8} \
  --cuda-graph-backend-prefill disabled --max-mamba-cache-size ${MAMBA:-16} --max-total-tokens ${MAXTOK:-270336}"
 for a in "$@"; do INNER+=" $(printf '%q' "$a")"; done
