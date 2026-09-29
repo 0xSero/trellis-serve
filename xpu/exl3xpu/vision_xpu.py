@@ -7,17 +7,19 @@ What stock SGLang v0.5.20 does with this checkpoint (qwen4_exp -> Qwen3VLForCond
   * sizes the MLP at intermediate_size 4304, while exllamav3 quantized it padded to 4352 (fc1 bias is stored padded);
   * hashes the n-gram (PLE) table with SGLang's multimodal pad values at image positions, where exllamav3 / HF hash
     the literal placeholder token (image_token_id).
-install() fixes all four without SGLang source edits:
+install() fixes all of it without SGLang source edits:
   1. the ViT is built with the EXL3 quant config (Exl3XpuLinearMethod: had_in + trellis reconstruct + oneDNN GEMM +
      had_out, the same XPU kernels as the text linears) and intermediate_size padded to the checkpoint's fc1 width;
   2. q_proj/k_proj/v_proj EXL3 tensors (and their fp16 biases) are routed into the fused qkv_proj with shard ids;
      the unused bf16 qkv tensors are dropped;
-  3. Qwen4ExpVLModel.forward maps multimodal pad values back to image/video token ids before the PLE hash;
-  4. an XPU vision attention backend "exl3_sdpa": per image (cu_seqlens segment) torch SDPA, no s x s mask, queries
-     chunked to bound the transient (SGLang's default xpu_attn needs sgl_kernel flash_attn_varlen_func; the ViT's
-     head_dim is 72).
+  3. multimodal pad values are mapped back to image/video token ids for the PLE hash (in the outer forward: SGLang's
+     mm routine clamps the pads to vocab-1 in place before the language model runs);
+  4. an XPU vision attention backend "exl3_sdpa": per image (cu_seqlens segment) torch SDPA (fused on XPU), no s x s
+     mask (SGLang's default xpu_attn needs sgl_kernel flash_attn_varlen_func; the ViT's head_dim is 72);
+  5. a row-chunked ViT block (bounded peak memory up to 4096^2 images) and an empty torch cache after each ViT call.
 Env: EXL3_VISION=0 disables all of it; EXL3_VIT_ATTN (default exl3_sdpa; xpu_attn / sdpa / triton_attn = SGLang's)
-replaces SGLang's XPU default; EXL3_VIT_ATTN_MB (default 512) bounds the attention score transient.
+replaces SGLang's XPU default; EXL3_VIT_ATTN_ROWS (default 8192) query rows per SDPA call;
+EXL3_VIT_ROWS (default 8192) rows per chunk of the ViT block; EXL3_VIT_LOG=1 logs every ViT call (ms, peak memory).
 """
 from __future__ import annotations
 
@@ -48,7 +50,9 @@ class VisionChunkedSdpa(torch.nn.Module):
         super().__init__()
         self.head_dim, self.num_heads, self.num_kv_heads = head_dim, num_heads, num_kv_heads
         self.scale = softmax_scale
-        self.budget = int(os.environ.get("EXL3_VIT_ATTN_MB", "512")) << 20
+        # torch's XPU SDPA is fused (no s x s scores: peak = the output chunk, measured), so the query chunk only
+        # bounds the output transient; < 512 rows per call halves the throughput (tests: sdpa_bench, 12:40 CEST)
+        self.rows = int(os.environ.get("EXL3_VIT_ATTN_ROWS", "8192"))
 
     def forward(self, q, k, v, cu_seqlens=None, bsz: int = 1, seq_len: int | None = None, softmax_scale=None,
                 **kwargs):
@@ -71,7 +75,7 @@ class VisionChunkedSdpa(torch.nn.Module):
                 continue
             kk = k[s0:s1].transpose(0, 1).unsqueeze(0)          # [1, H, L, D]
             vv = v[s0:s1].transpose(0, 1).unsqueeze(0)
-            qc = max(64, self.budget // max(1, H * L * 4))       # fp32 score rows that fit the budget
+            qc = max(512, self.rows)
             for c0 in range(s0, s1, qc):
                 c1 = min(s1, c0 + qc)
                 qq = q[c0:c1].transpose(0, 1).unsqueeze(0)       # [1, H, c, D]
