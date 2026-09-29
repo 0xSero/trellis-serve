@@ -1222,6 +1222,12 @@ def activate() -> None:
             ngram_host.install()
         except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp
             logger.info("exl3xpu: n-gram host table shim not installed (%s)", e)
+    try:
+        # image input: EXL3 ViT on the XPU kernels, q/k/v routing, PLE placeholder remap, XPU vision attention
+        from . import vision_xpu
+        vision_xpu.install()
+    except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp / qwen3_vl
+        logger.info("exl3xpu: vision shim not installed (%s)", e)
     _patch_mtp()
     _patch_xpu_spec_sampling()
     _patch_xpu_gdn_verify()
