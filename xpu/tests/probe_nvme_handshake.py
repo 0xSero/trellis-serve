@@ -1,0 +1,31 @@
+"""X008 debug: step through the XPU publish/wait handshake with host-side reads of the ctrl words."""
+import ctypes, sys, os, time, torch
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from exl3xpu.ngram_nvme import Exl3NgramNvmeTable
+dev = torch.device("xpu", 0)
+nv = Exl3NgramNvmeTable("/model", ram_gb=1.0, device=dev)
+ctrl = (ctypes.c_uint32 * 8).from_address(nv.ctrl_dev & ((1 << 64) - 1))
+print("ctrl0", list(ctrl), flush=True)
+ids = torch.randint(0, nv.num_rows, (1, 16), dtype=torch.int64, device=dev)
+nv.ext.nvme_publish(ids.reshape(-1), nv.req_dev, nv.ctrl_dev, nv.dseq)
+torch.xpu.synchronize()
+print("after publish: dseq", nv.dseq.tolist(), "ctrl", list(ctrl), flush=True)
+time.sleep(1.0)
+print("1 s later ctrl", list(ctrl), flush=True)
+nv.timeout_ns = int(2e9)
+slots = nv.slots_dev[:16]
+t = time.perf_counter()
+nv.ext.nvme_wait(nv.ctrl_dev, nv.dseq, nv.stall, nv.resp_dev, slots, 16, nv.timeout_ns)
+torch.xpu.synchronize()
+print("wait %.3f ms stall %s ctrl %s" % ((time.perf_counter() - t) * 1e3, nv.stall.tolist(), list(ctrl)), flush=True)
+resp = (ctypes.c_int64 * 16).from_address(nv.resp_dev & ((1 << 64) - 1))
+print("slots", slots.tolist(), "\nresp ", list(resp), "nslots", nv.nslots, flush=True)
+# back-to-back publish -> wait (no host sync), then gather
+ids2 = torch.randint(0, nv.num_rows, (3, 16), dtype=torch.int64, device=dev)
+nv.ext.nvme_publish(ids2.reshape(-1), nv.req_dev, nv.ctrl_dev, nv.dseq)
+nv.ext.nvme_wait(nv.ctrl_dev, nv.dseq, nv.stall, nv.resp_dev, nv.slots_dev[:48], 48, nv.timeout_ns)
+torch.xpu.synchronize()
+print("b2b slots", nv.slots_dev[:48].tolist(), "stall", nv.stall.tolist(), "ctrl", list(ctrl), flush=True)
+out = nv.gather(ids2); torch.xpu.synchronize()
+print("gather ok", out.float().abs().mean().item(), flush=True)
+os._exit(0)

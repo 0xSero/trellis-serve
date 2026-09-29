@@ -181,7 +181,11 @@ class Exl3NgramHostTable(torch.nn.Module):
 def get_table(model_path: str) -> Exl3NgramHostTable:
     t = _TABLES.get(model_path)
     if t is None:
-        t = _TABLES[model_path] = Exl3NgramHostTable(model_path)
+        if os.environ.get("EXL3_NGRAM_TIER", "host") == "nvme":
+            from .ngram_nvme import Exl3NgramNvmeTable      # tier 2: NVMe rows + RAM row cache (X008)
+            t = _TABLES[model_path] = Exl3NgramNvmeTable(model_path)
+        else:
+            t = _TABLES[model_path] = Exl3NgramHostTable(model_path)
     return t
 
 
