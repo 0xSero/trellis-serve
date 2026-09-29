@@ -538,6 +538,39 @@ def main():
         for tokens in [int(t) for t in a.prefill_tokens.split(",") if t]:
             for where in ("device", "host"):
                 print("prefill", bench_prefill(L, gen, tokens, a.prefill_reps, False, where), flush=True)
+    if "fewmiss" in only:
+        # K07: 1-token layer, exactly m of the 10 routed experts host-resident (zero-copy), the rest in device slots
+        ids, w = uniform_routing(1, 10, L.e, gen)
+        x = (torch.randn((1, L.hidden), generator=gen) * 0.5).to(torch.bfloat16).cuda()
+        L.set_table("device")
+        sd = torch.cuda.Stream(); sd.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(sd):
+            L.run_ptr(x, ids, w)
+        torch.cuda.current_stream().wait_stream(sd)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            L.run_ptr(x, ids, w)
+        res = {}
+        for m in (0, 1, 2, 3, 5, 10):
+            ts = []
+            for r in range(a.reps + 5):
+                r_ids, r_w = uniform_routing(1, 10, L.e, gen)
+                ids.copy_(r_ids); w.copy_(r_w)
+                mask = torch.zeros(L.e, dtype=torch.bool, device="cuda")
+                mask[r_ids[0, :m].long()] = True
+                L.set_table("mixed", mask)
+                torch.cuda.synchronize()
+                e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                e0.record(); g.replay(); e1.record(); torch.cuda.synchronize()
+                if r >= 5:
+                    ts.append(e0.elapsed_time(e1) * 1000)
+            med = statistics.median(ts)
+            res[m] = {"median_us": round(med, 1), "model_us": 5.5 * (10 - m) + 73 * m}
+            print("FEWMISS", m, res[m], flush=True)
+        base = res[0]["median_us"]
+        for m in (1, 2, 3, 5, 10):
+            extra = res[m]["median_us"] - base
+            print("FEWMISS_GBPS", m, "extra us", round(extra, 1), "effective GB/s", round(m * L.lay.record_bytes / (extra * 1e-6) / 1e9, 2), flush=True)
     if "gather" in only:
         r = bench_gather_then_compute(L, gen, a.reps)
         print("gather_then_compute", r, flush=True)

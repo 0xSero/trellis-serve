@@ -275,6 +275,28 @@ class ExpertCache:
         src_out.copy_(torch.where(res, torch.zeros_like(stage), self.host_bases[layer] + e * rec))
         dst_out.copy_(stage)
 
+    def run_fused(self, layer: int, x, topk_weights, topk_ids, codebook: int = 2, out=None) -> torch.Tensor:
+        """K07 decode path (T * top_k <= 1024 slots, block 8): ONE prologue launch (deferred commit of this layer's
+        previous admissions + ids clean + align + cache step) then the five MoE launches with fused admission. Admitted
+        experts are committed to the table by this layer's next prologue (so the admit rows stay set until then).
+        Bit-identical to run() (same align order, same kernels)."""
+        ids = topk_ids.reshape(-1)
+        if ids.dtype != torch.int32:
+            ids = ids.to(torch.int32)
+        ids = ids.contiguous()
+        n = ids.numel()
+        dev = ids.device
+        ids_out = torch.empty_like(ids)
+        sorted_ids = torch.empty((n * 8,), dtype=torch.int32, device=dev)
+        eids = torch.empty((n,), dtype=torch.int32, device=dev)
+        post = torch.empty((1,), dtype=torch.int32, device=dev)
+        _mod().moe_cache_decode_prologue(ids, layer, self.slot_of, self.owner, self.stamp, self.ref, self.hand, self.clock,
+                                         self.tables, self.admit, self.host_bases, self.arena.data_ptr(),
+                                         self.lay.record_bytes, self.offs, self.stats, self.S > 0,
+                                         ids_out, sorted_ids, eids, post)
+        return run(x, topk_weights, ids_out.view(topk_ids.shape), sorted_ids, eids, post, 8, self.tables[layer], self.lay,
+                   codebook, out=out, admit=self.admit[layer] if self.S > 0 else None)
+
     def hit_rate(self) -> torch.Tensor:
         s = self.stats.double()
         return s[:, 0] / (s[:, 0] + s[:, 1]).clamp(min=1)

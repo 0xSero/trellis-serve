@@ -619,7 +619,10 @@ __global__ void trellis_moe_copy_fields_kernel(const int64_t* __restrict__ src, 
   int4* d = reinterpret_cast<int4*>(dst[e * stride + field]);
   if (d == nullptr) return;
   const int4* s = reinterpret_cast<const int4*>(src[e * stride + field]);
-  for (int i = threadIdx.x; i < n16; i += blockDim.x) d[i] = s[i];
+  // K07: one 16-B (zero-copy) load per thread (grid.y chunks of 256 x 16 B per slot): all loads of a slot are in flight
+  // at once instead of ~5 dependent PCIe round trips per thread
+  const int i = blockIdx.y * blockDim.x + threadIdx.x;
+  if (i < n16) d[i] = s[i];
 }
 
 void moe_copy_fields(const at::Tensor& src, const at::Tensor& dst, const at::Tensor& ids, int64_t field, int64_t nbytes) {
@@ -628,7 +631,8 @@ void moe_copy_fields(const at::Tensor& src, const at::Tensor& dst, const at::Ten
   check_ptrs(dst, field);
   TORCH_CHECK(src.sizes() == dst.sizes() && is_index(ids) && ids.is_contiguous() && nbytes % 16 == 0 && nbytes > 0);
   if (ids.numel() == 0) return;
-  trellis_moe_copy_fields_kernel<<<(unsigned)ids.numel(), 256, 0, at::cuda::getCurrentCUDAStream().stream()>>>(
+  dim3 grid((unsigned)ids.numel(), (unsigned)((nbytes / 16 + 255) / 256));
+  trellis_moe_copy_fields_kernel<<<grid, 256, 0, at::cuda::getCurrentCUDAStream().stream()>>>(
       src.data_ptr<int64_t>(), dst.data_ptr<int64_t>(), ids.data_ptr(), ids.dtype() == at::kLong, (int)src.size(1),
       (int)src.size(0), (int)field, (int)(nbytes / 16));
 }
@@ -944,10 +948,17 @@ void moe_cache_step(const at::Tensor& ids, int64_t layer, at::Tensor& slot_of, a
                     const at::Tensor& host_bases, int64_t arena_base, int64_t rec, const at::Tensor& offs,
                     at::Tensor& stats, bool do_admit);
 void moe_cache_commit(const at::Tensor& ids, int64_t layer, at::Tensor& tables, at::Tensor& admit);
+void moe_cache_decode_prologue(const at::Tensor& ids, int64_t layer, at::Tensor& slot_of, at::Tensor& owner,
+                               at::Tensor& stamp, at::Tensor& ref, at::Tensor& hand, at::Tensor& clock,
+                               at::Tensor& tables, at::Tensor& admit, const at::Tensor& host_bases, int64_t arena_base,
+                               int64_t rec, const at::Tensor& offs, at::Tensor& stats, bool do_admit,
+                               at::Tensor& ids_out, at::Tensor& sorted, at::Tensor& eids, at::Tensor& post);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_cache_step", &moe_cache_step, "expert cache: hits/misses, CLOCK victims, evictions, admission rows (before the MoE)");
   m.def("moe_cache_commit", &moe_cache_commit, "expert cache: consumed admission rows -> table (after the MoE)");
+  m.def("moe_cache_decode_prologue", &moe_cache_decode_prologue,
+        "K07 fused decode prologue: deferred commit + ids clean + align (block 8) + cache step, one launch");
   m.def("moe_align_decode", &moe_align_decode, "decode-sized routing for mixed-K layers: vLLM moe_align_block_size outputs for every K class in ONE launch",
         py::arg("topk_ids"), py::arg("maps"), py::arg("blocks"), py::arg("num_experts"), py::arg("sorted"), py::arg("expert_ids"), py::arg("num_post"));
   m.def("moe_gemm", &moe_gemm, "grouped rotated-basis EXL3 GEMM over moe blocks (+ in-launch output transform)",
