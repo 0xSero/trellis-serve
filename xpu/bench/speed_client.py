@@ -8,7 +8,7 @@ Prefill / decode speed against an SGLang server (C1).
 import argparse, json, random, time, urllib.request
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--url", default="http://127.0.0.1:30200")
+ap.add_argument("--url", default="http://127.0.0.1:30250")
 ap.add_argument("--prefill", default="4096")
 ap.add_argument("--decode-ctx", default="0")
 ap.add_argument("--reps", type=int, default=1)

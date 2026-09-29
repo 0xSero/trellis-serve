@@ -14,7 +14,7 @@ import argparse, json, math, time, urllib.request
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--panel", required=True)
-ap.add_argument("--url", default="http://127.0.0.1:30200")
+ap.add_argument("--url", default="http://127.0.0.1:30250")
 ap.add_argument("--topk", type=int, default=64)
 ap.add_argument("--no-greedy", action="store_true")
 ap.add_argument("--out", default="")

@@ -46,7 +46,7 @@ for L_, pages in ((100, 1024), (3000, 1024), (60000, 1024)):
     lg = MQ.torch_qsa_mqa_decode(qd, cache, pt, lens, pages * ps)
     a = qsa_xpu.qsa_fast_topk(lg, torch.zeros_like(lens), lens, 512)
     scratch = torch.empty(1, pages * ps, device=dev); o = torch.empty(1, 512, dtype=torch.int32, device=dev)
-    X.qsa_decode_select(qd, cache, pt, lens, scratch, o, 512)
+    X.qsa_decode_select(qd, cache, pt, lens, scratch, o, 512, 4)
     sa, so = set(a[0][a[0] >= 0].tolist()), set(o[0][o[0] >= 0].tolist())
     print("decode select len", L_, "same set:", sa == so, len(sa), len(so), "sym diff", len(sa ^ so))
     bad += len(sa ^ so) > 2          # bf16 score ties at the boundary may swap one entry

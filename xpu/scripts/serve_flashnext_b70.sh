@@ -3,11 +3,11 @@
 #   routed experts in USM host memory (tier 1) + device-managed LRU expert cache (EXL3_MOE_SLOTS slots, EXL3_MOE_CACHE=1),
 #   n-gram table in USM host memory (zero-copy gather + decode), dense EXL3 linears via exl3xpu_C.
 # Foreground (run it in tmux):  serve_flashnext_b70.sh <run dir> [extra sglang args...]
-# Env: CARD (ZE_AFFINITY_MASK, default 1), PORT (30200), NAME (ftx-srv), IMAGE, MODEL, CTX, MEMFRAC, CHUNK, KVDTYPE,
+# Env: CARD (ZE_AFFINITY_MASK, default 1), PORT (30250), NAME (ftx-srv), IMAGE, MODEL, CTX, MEMFRAC, CHUNK, KVDTYPE,
 #      SLOTS (EXL3_MOE_SLOTS), MAXREQ; EXL3_* / SGLANG_* are forwarded.
 set -uo pipefail
 RUN=${1:?run dir}; shift; mkdir -p "$RUN"
-CARD=${CARD:-1}; PORT=${PORT:-30200}; NAME=${NAME:-ftx-srv}; IMAGE=${IMAGE:-lmsysorg/sglang:v0.5.20-xpu}
+CARD=${CARD:-1}; PORT=${PORT:-30250}; NAME=${NAME:-ftx-srv}; IMAGE=${IMAGE:-lmsysorg/sglang:v0.5.20-xpu}
 MODEL=${MODEL:-turboderp-Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5}
 TS=${TS:-$HOME/freetoken-exl3/kernels/xpu_bmg/trellis-serve}
 X=/opt/trellis-serve/xpu/exl3xpu

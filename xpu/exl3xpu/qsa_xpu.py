@@ -216,7 +216,8 @@ def install() -> None:
                 out = torch.empty((B, self.block_topk), dtype=torch.int32, device=q.device)
                 _ops().qsa_decode_select(q.contiguous(), compressed_cache.contiguous(),
                                          compressed_page_table.to(torch.int32).contiguous(),
-                                         compressed_lengths.to(torch.int32).contiguous(), scratch, out, self.block_topk)
+                                         compressed_lengths.to(torch.int32).contiguous(), scratch, out, self.block_topk,
+                                         int(getattr(self, "index_n_heads", 0) or 0))
                 return expand_qsa_block_indices(out, query_positions, sequence_lengths,
                                                 compress_ratio=self.compress_ratio, token_topk=self.token_topk)
             cls.select_decode_tokens = select_decode_tokens
