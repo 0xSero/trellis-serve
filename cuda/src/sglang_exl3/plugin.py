@@ -52,6 +52,9 @@ def activate() -> None:
         from .sglang_glue import vit_attn
         vit_attn.install_mlp_chunk(int(os.environ["SGLANG_EXL3_VIT_MLP_CHUNK"]))
         logger.info("sglang-exl3: vision MLP row-chunked at %s rows", os.environ["SGLANG_EXL3_VIT_MLP_CHUNK"])
+    if os.environ.get("SGLANG_EXL3_HC_INT8", "0") not in ("", "0", "off"):
+        from .sglang_glue import hc_int8_patch
+        hc_int8_patch.install()          # int8 hyper-connection mix weights (K06)
     logger.info("sglang-exl3: registered quantization method 'exl3'")
 
 
