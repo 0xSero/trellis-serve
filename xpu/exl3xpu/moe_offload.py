@@ -118,6 +118,8 @@ class ExpertStore:
         self.fill_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
         self.pf_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
         self.pf_slot = torch.zeros(n_experts, dtype=torch.int32, device=self.dev)
+        self.pend = torch.zeros(max_layers * 35, dtype=torch.int32, device=self.dev)      # copy-engine prefetch state
+        self.done_seq = torch.zeros(0, dtype=torch.int32, device=self.dev)               # set by start_copy_prefetch
         self.slot_base = s64(self.slots.data_ptr()) if n_slots else 0
         self._cache_used = False            # set by forward_cached: static ops must resync from the device first
 
@@ -244,7 +246,7 @@ class ExpertStore:
         return self.X.moe_forward_cached(x, ids, w, self.ptrs_all, self.layer_index[key], self.slot_of_dev,
                                          self.slot_key, self.slot_last, self.tick, self.host_base, self.slot_base,
                                          self.fill_all, self.fill_list, self.E if max_fill is None else max_fill,
-                                         self.I, self.K, self.E)
+                                         self.I, self.K, self.E, self.pend, self.done_seq)
 
     def prefetch(self, key, ids: torch.Tensor, max_fill: int = 16) -> None:
         """Claim LRU slots for the (predicted) experts `ids` of layer `key` and copy them from host memory, on the
@@ -257,6 +259,47 @@ class ExpertStore:
         self.X.moe_prefetch(ids.flatten(), self.ptrs_all, self.layer_index[key], self.slot_of_dev, self.slot_key,
                             self.slot_last, self.tick, self.host_base, self.slot_base, self.pf_list, self.pf_slot,
                             max_fill, self.E, self.blob)
+
+    # ---- copy-engine prefetch (device plan -> host worker -> queue.memcpy), X006b
+    def start_copy_prefetch(self) -> None:
+        """Start the C++ worker that turns device-written prefetch plans into copy-engine transfers."""
+        L, E = len(self.layer_index), self.E
+        self._plans = self.X.host_alloc(L * (4 + 2 * E) * 4)
+        self._plans.zero_()
+        self._plan_seq = torch.zeros(L, dtype=torch.int32, device=self.dev)
+        self.done_seq = torch.zeros(L, dtype=torch.int32, device=self.dev)
+        self.pend.zero_()
+        self._commit_host = self.X.host_alloc(L * 2 * E * 12)
+        hb = torch.zeros(L, dtype=torch.int64)
+        for key, li in self.layer_index.items():
+            hb[li] = int(self._host_ptr[key][0])
+        torch.xpu.synchronize()
+        self._pf_stream = torch.xpu.Stream()
+        with torch.xpu.stream(self._pf_stream):     # the worker submits its copies to this stream's queue
+            self.X.moe_prefetch_worker_start(self._plans, hb, self.slot_base, self.blob, self.ptrs_all, self.slot_last,
+                                             self._commit_host, self.done_seq, L, E)
+
+    def plan_prefetch(self, key, ids: torch.Tensor, max_fill: int = 16) -> None:
+        """On the COMPUTE stream (e.g. right after MoE(l) for layer l+1): pin LRU slots for the predicted experts and
+        publish the plan; the worker copies them on the copy engine and commits. The compute stream never waits."""
+        ids = ids if ids.dtype == torch.int32 and ids.is_contiguous() else ids.to(torch.int32).contiguous()
+        self._cache_used = True
+        self.X.moe_prefetch_plan(ids.flatten(), self.ptrs_all, self.layer_index[key], self.slot_of_dev, self.slot_key,
+                                 self.slot_last, self.tick, self.host_base, self.slot_base, self.pf_list, self.pf_slot,
+                                 self._plans, self._plan_seq, self.pend, self.done_seq, max_fill, self.E, self.blob)
+
+    def stop_copy_prefetch(self):
+        """Stop the worker (drains its queue), then commit what finished (one empty ensure pass); returns
+        [plans handled, experts copied]. Afterwards forward_cached runs without prefetch commits."""
+        r = self.X.moe_prefetch_worker_stop()
+        if self.done_seq.numel():
+            k0 = next(iter(self.layer_index))
+            x = torch.zeros((1, self.H), dtype=torch.bfloat16, device=self.dev)
+            ids = torch.zeros((1, 1), dtype=torch.int32, device=self.dev)
+            self.forward_cached(k0, x, ids, torch.ones((1, 1), device=self.dev), max_fill=0)   # commit pass
+            torch.xpu.synchronize()
+            self.done_seq = torch.zeros(0, dtype=torch.int32, device=self.dev)
+        return r
 
     # ---- prefill staging (FreeToken-style layer streaming)
     def stage_layer(self, key, buf: int, stream) -> torch.Tensor:
@@ -294,6 +337,7 @@ class ExpertStore:
         self.slot_key.fill_(-1)
         self.slot_last.fill_(-1)
         self.fill_all.zero_()
+        self.pend.zero_()
         self.slot_owner = [None] * self.n_slots
         self.free_slots = list(range(self.n_slots - 1, -1, -1))
         self._slot_ready_ev.clear()

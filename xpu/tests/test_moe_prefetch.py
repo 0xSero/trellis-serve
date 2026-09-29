@@ -54,16 +54,19 @@ pop = {L: -a.zipf * torch.log1p(torch.randperm(E, generator=torch.Generator().ma
 # other work sized to ~other_us
 A = torch.randn((1024, 1024), device=dev, dtype=torch.bfloat16)
 Bm = torch.randn((1024, 1024), device=dev, dtype=torch.bfloat16)
+# calibrate by DEVICE time (events over a queue of GEMMs), not host wall time (Python launch cost dominates)
 for _ in range(20):
     A @ Bm
 torch.xpu.synchronize()
-t = time.perf_counter()
-for _ in range(50):
+e0, e1 = torch.xpu.Event(enable_timing=True), torch.xpu.Event(enable_timing=True)
+e0.record()
+for _ in range(200):
     A @ Bm
+e1.record()
 torch.xpu.synchronize()
-one = (time.perf_counter() - t) / 50 * 1e6
+one = e0.elapsed_time(e1) / 200 * 1e3
 reps = max(1, round(a.other_us / one))
-print(f"other work: {reps} x 1024^2 GEMM = ~{reps * one:.0f} us per layer", flush=True)
+print(f"other work: {reps} x 1024^2 GEMM = ~{reps * one:.0f} us device time per layer", flush=True)
 
 
 def other():
@@ -87,8 +90,12 @@ def predict(ids, p, tok, L):
 
 
 res = []
-for p in (None, 0.0, 0.7, 1.0):
+modes = [("none", None), ("copy_engine", 0.0), ("copy_engine", 0.7), ("copy_engine", 1.0)] + \
+        ([("kernel", 0.7), ("kernel", 1.0)] if os.environ.get("PF_KERNEL") else [])
+for mode, p in modes:
     store.reset_cache()
+    if mode == "copy_engine":
+        store.start_copy_prefetch()
     cs = torch.xpu.current_stream()
     side = torch.xpu.Stream()
     x = (torch.randn((1, H), device=dev) * 0.5).to(torch.bfloat16)
@@ -105,30 +112,45 @@ for p in (None, 0.0, 0.7, 1.0):
             t0 = time.perf_counter()
         for L in range(a.layers):
             other()
-            if p is not None:
+            if mode == "kernel":
                 cs.wait_stream(side)                      # prefetch of this layer complete before its MoE call
             ids, w = dev_routes[tok][L]
             y = store.forward_cached(L, x, ids, w)
-            if p is not None:
-                nt, nl = (tok, L + 1) if L + 1 < a.layers else (tok + 1, 0)
-                if nt < a.tokens:
-                    side.wait_stream(cs)                  # after this MoE call
-                    with torch.xpu.stream(side):
-                        store.prefetch(nl, preds[nt][nl])
+            nt, nl = (tok, L + 1) if L + 1 < a.layers else (tok + 1, 0)
+            if mode == "kernel" and nt < a.tokens:
+                side.wait_stream(cs)                      # after this MoE call
+                with torch.xpu.stream(side):
+                    store.prefetch(nl, preds[nt][nl])
+            if mode == "copy_engine" and nt < a.tokens:
+                store.plan_prefetch(nl, preds[nt][nl])    # compute stream; copies run on the copy engine
             if tok % 10 == 0:
                 ref = store.forward(L, x, ids, w, ptrs=host_tab[L])
                 bad += int(not torch.equal(y, ref))
     torch.xpu.synchronize()
     dt_ = (time.perf_counter() - t0) / ((a.tokens - warm) * a.layers) * 1e6
+    stats = store.stop_copy_prefetch() if mode == "copy_engine" else None
+    torch.xpu.synchronize()
     # consistency
     sk, sod, pa = store.slot_key.cpu(), store.slot_of_dev.cpu(), store.ptrs_all.cpu()
     inc = 0
+    cats = {"slot_of": 0, "ptr_host": 0, "ptr_other": 0, "content": 0, "pinned": 0}
+    sl_ = store.slot_last.cpu()
     for s_ in range(a.slots):
         k = int(sk[s_])
-        if k >= 0 and (int(sod[k]) != s_ or int(pa[k]) != store.slot_ptr(s_) or
-                       not torch.equal(store.slots[s_].cpu(), store.host[k // E][k % E])):
-            inc += 1
-    rec = {"prefetch_accuracy": p, "layers": a.layers, "slots": a.slots, "zipf": a.zipf, "other_us": round(reps * one),
+        if k < 0:
+            continue
+        bad_ = False
+        if int(sod[k]) != s_:
+            cats["slot_of"] += 1; bad_ = True
+        if int(pa[k]) != store.slot_ptr(s_):
+            cats["ptr_host" if int(pa[k]) == int(store._host_ptr[k // E][k % E]) else "ptr_other"] += 1; bad_ = True
+        if not torch.equal(store.slots[s_].cpu(), store.host[k // E][k % E]):
+            cats["content"] += 1; bad_ = True
+        if int(sl_[s_]) == 0x7FFFFFFF:
+            cats["pinned"] += 1
+        inc += bad_
+    print("inconsistency categories:", cats, flush=True)
+    rec = {"mode": mode, "prefetch_accuracy": p, "worker_plans_copies": stats, "layers": a.layers, "slots": a.slots, "zipf": a.zipf, "other_us": round(reps * one),
            "us_per_layer_incl_other": round(dt_, 1), "unequal_outputs": bad, "inconsistent_slots": inc}
     res.append(rec)
     print(rec, flush=True)

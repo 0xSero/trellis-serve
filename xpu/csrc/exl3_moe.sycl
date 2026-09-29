@@ -26,6 +26,9 @@
 #include <c10/xpu/XPUStream.h>
 #include "exl3_esimd.h"
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <atomic>
+#include <thread>
+#include <memory>
 
 using namespace exl3;
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -807,7 +810,15 @@ static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, c
 static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer, int E, int S, int64_t* ptrs_all,
                           int* slot_of, int* slot_key, int* slot_last, int* tick, const int64_t* host_base,
                           int64_t slot_base, int64_t blob, int64_t* fill_all, int* fill_list, int max_fill,
-                          int* pf_slot = nullptr) {
+                          int* pf_slot = nullptr, int* host_plan = nullptr, int* plan_seq = nullptr,
+                          int* pend = nullptr, const int* done_seq = nullptr, int n_layers = 0) {
+    // pend (device, per layer li: [n, seq, T, e[16], s[16]] = 35 ints) + done_seq[li] (written ONLY by the copy
+    // engine after a plan's data): every ensure/plan call first commits finished plans on the device (ptrs -> slot,
+    // unpin). The copy engine never writes metadata the device writes (no shared cache lines between agents).
+    // host_plan != nullptr (with pf_slot): copy-engine prefetch plan. Planned slots are PINNED (slot_last = INT_MAX:
+    // never a victim, hits do not re-stamp them) and (e, s) pairs are written to USM host memory for the host worker
+    // (moe_prefetch_worker_*), which copies the blobs on the copy engine and then commits ptrs / slot_last with
+    // ordered 8- / 4-byte copies. Layout (int32): [seq, n, T, layer, e[E], s[E]]; seq published last (system scope).
     // pf_slot != nullptr: PREFETCH mode (side queue, between two MoE calls): the tick is not advanced, so slots
     // touched by the last MoE call (last == T) stay protected; hits are re-stamped T; misses get LRU slots with
     // last < T, recorded as fill_list = [n, e...], pf_slot = [s...] for the gather-copy + commit kernels (no
@@ -827,14 +838,41 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
                                           sycl::access::address_space::local_space>;
             if (l == 0) { sc[0] = prefetch ? tick[0] : ++tick[0]; sc[1] = 0; sc[2] = 0; sc[3] = 0; }
             for (int e = l; e < E; e += WG) need[e] = 0;
+            if (pend) {
+                // commit finished copy-engine prefetches: decide once per layer (vict[] as flags), then commit, then reset
+                constexpr int PS = 35;
+                for (int li = l; li < n_layers; li += WG) {
+                    int* pl = pend + li * PS;
+                    int dn = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                                              sycl::access::address_space::global_space>(*const_cast<int*>(done_seq + li)).load();
+                    vict[li] = (pl[0] > 0 && dn >= pl[1]) ? 1 : 0;
+                }
+                sycl::group_barrier(g);
+                for (int w = l; w < n_layers * 16; w += WG) {
+                    int li = w / 16, i = w % 16;
+                    int* pl = pend + li * PS;
+                    if (vict[li] && i < pl[0]) {
+                        int e = pl[3 + i], s = pl[3 + 16 + i];
+                        ptrs_all[li * E + e] = slot_base + (int64_t)s * blob;
+                        slot_last[s] = pl[2];
+                    }
+                }
+                sycl::group_barrier(g);
+                for (int li = l; li < n_layers; li += WG)
+                    if (vict[li]) pend[li * PS] = 0;
+            }
             sycl::group_barrier(g);
+            if (host_plan && pend[layer * 35] > 0) {      // previous plan of this layer still in flight: skip
+                if (l == 0) fill_list[0] = 0;
+                return;
+            }
             for (int i = l; i < npairs; i += WG) need[ids[i]] = 1;
             sycl::group_barrier(g);
             const int T = sc[0];
             for (int e = l; e < E; e += WG) {
                 if (!need[e]) continue;
                 int s = slot_of[layer * E + e];
-                if (s >= 0) slot_last[s] = T;
+                if (s >= 0) { if (slot_last[s] != 0x7FFFFFFF) slot_last[s] = T; }   // pinned: copy in flight
                 else miss[lref(sc[1]).fetch_add(1)] = e;
             }
             sycl::group_barrier(g);
@@ -924,12 +962,29 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
                     ptrs_all[old] = host_base[old / E] + (int64_t)(old % E) * blob;
                 }
                 int key = layer * E + e;
-                slot_key[s] = key; slot_last[s] = T; slot_of[key] = s;
+                slot_key[s] = key; slot_of[key] = s;
+                slot_last[s] = host_plan ? 0x7FFFFFFF : T;
                 if (prefetch) pf_slot[mi] = s;
                 else fill_all[key] = slot_base + (int64_t)s * blob;
                 fill_list[1 + mi] = e;
+                if (host_plan) {
+                    host_plan[4 + mi] = e; host_plan[4 + E + mi] = s;
+                    pend[layer * 35 + 3 + mi] = e; pend[layer * 35 + 3 + 16 + mi] = s;
+                }
             }
-            if (l == 0) fill_list[0] = nm;
+            if (host_plan) sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            sycl::group_barrier(g);
+            if (l == 0) {
+                fill_list[0] = nm;
+                if (host_plan) {
+                    host_plan[1] = nm; host_plan[2] = T; host_plan[3] = layer;
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+                    int sq = ++plan_seq[layer];
+                    if (nm > 0) { pend[layer * 35 + 1] = sq; pend[layer * 35 + 2] = T; pend[layer * 35] = nm; }
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                                     sycl::access::address_space::global_space>(host_plan[0]).store(sq);
+                }
+            }
         });
     });
 }
@@ -937,6 +992,105 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
 static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, const int64_t* pp_override,
                                    at::Tensor ptrs, int64_t I, int64_t K, int64_t n_experts, const int64_t* fill,
                                    int64_t* commit_ptrs, int64_t* commit_fill, const int* fill_list);
+
+// ------------------------------------------------------------------------------------------------
+// Copy-engine prefetch: plan kernel (compute stream) + host worker thread (no GIL, own in-order queue).
+struct PfWorker {
+    sycl::queue q;
+    std::thread th;
+    std::atomic<bool> stop{false};
+    int* plans = nullptr;            // host USM, L x (4 + 2E) int32
+    int L = 0, E = 0;
+    std::vector<int64_t> host_base;
+    int64_t slot_base = 0, blob = 0;
+    int64_t* ptrs_all = nullptr; int* slot_last = nullptr; int* done_seq = nullptr;
+    int64_t* cv = nullptr; int* lv = nullptr;   // host USM commit values [L][2][E]
+    std::vector<int> last_seq;
+    std::atomic<int64_t> n_plans{0}, n_copies{0};
+    void run() {
+        const int stride = 4 + 2 * E;
+        while (!stop.load(std::memory_order_relaxed)) {
+            bool any = false;
+            for (int li = 0; li < L; ++li) {
+                int* pl = plans + (size_t)li * stride;
+                int seq = __atomic_load_n(pl, __ATOMIC_ACQUIRE);
+                if (seq == last_seq[li]) continue;
+                any = true;
+                int n = __atomic_load_n(pl + 1, __ATOMIC_ACQUIRE), T = pl[2];
+                int par = seq & 1;
+                int64_t* c = cv + ((size_t)li * 2 + par) * E;
+                int* lvv = lv + ((size_t)li * 2 + par) * E;
+                for (int i = 0; i < n; ++i) {
+                    int e = pl[4 + i], s = pl[4 + E + i];
+                    q.memcpy(reinterpret_cast<void*>(slot_base + (int64_t)s * blob),
+                             reinterpret_cast<const void*>(host_base[li] + (int64_t)e * blob), (size_t)blob);
+                }
+                (void)T; (void)c;
+                lvv[0] = seq;                                   // stable host source for the done flag
+                q.memcpy(done_seq + li, lvv, 4);                // device commits when it sees done_seq >= seq
+                last_seq[li] = seq;
+                n_plans++;
+                n_copies += n;
+            }
+            if (!any) std::this_thread::yield();
+        }
+        q.wait();
+    }
+};
+static std::unique_ptr<PfWorker> g_pfw;
+
+void moe_prefetch_worker_start(at::Tensor plans, at::Tensor host_base_cpu, int64_t slot_base, int64_t blob,
+                               at::Tensor ptrs_all, at::Tensor slot_last, at::Tensor commit_host, at::Tensor done_seq,
+                               int64_t n_layers, int64_t n_experts) {
+    TORCH_CHECK(!g_pfw, "prefetch worker already running");
+    // the CURRENT torch XPU stream's queue (caller: `with torch.xpu.stream(dedicated_stream)`): a queue built here
+    // with sycl::queue(ctx, dev, in_order) did not overlap its memcpys with compute on B70 (X006b v1: no gain even
+    // with 870 us/layer of compute); memcpy on a torch side stream overlaps fully (X002d).
+    auto w = std::make_unique<PfWorker>();
+    w->q = c10::xpu::getCurrentXPUStream().queue();
+    w->plans = reinterpret_cast<int*>(plans.data_ptr());
+    w->L = (int)n_layers; w->E = (int)n_experts;
+    w->host_base.assign(host_base_cpu.data_ptr<int64_t>(), host_base_cpu.data_ptr<int64_t>() + n_layers);
+    w->slot_base = slot_base; w->blob = blob;
+    w->ptrs_all = ptrs_all.data_ptr<int64_t>(); w->slot_last = slot_last.data_ptr<int>();
+    w->done_seq = done_seq.data_ptr<int>();
+    uint8_t* ch = reinterpret_cast<uint8_t*>(commit_host.data_ptr());
+    w->cv = reinterpret_cast<int64_t*>(ch);
+    w->lv = reinterpret_cast<int*>(ch + (size_t)n_layers * 2 * n_experts * 8);
+    w->last_seq.assign(n_layers, 0);
+    for (int li = 0; li < n_layers; ++li) w->last_seq[li] = w->plans[(size_t)li * (4 + 2 * n_experts)];
+    PfWorker* raw = w.get();
+    w->th = std::thread([raw] { raw->run(); });
+    g_pfw = std::move(w);
+}
+
+std::vector<int64_t> moe_prefetch_worker_stop() {
+    if (!g_pfw) return {0, 0};
+    g_pfw->stop = true;
+    g_pfw->th.join();
+    std::vector<int64_t> r{g_pfw->n_plans.load(), g_pfw->n_copies.load()};
+    g_pfw.reset();
+    return r;
+}
+
+// Plan kernel (compute stream): claim + pin slots for predicted experts, publish the plan to the host worker.
+void moe_prefetch_plan(at::Tensor ids, at::Tensor ptrs_all, int64_t layer, at::Tensor slot_of, at::Tensor slot_key,
+                       at::Tensor slot_last, at::Tensor tick, at::Tensor host_base, int64_t slot_base, at::Tensor pf_list,
+                       at::Tensor pf_slot, at::Tensor plans, at::Tensor plan_seq, at::Tensor pend, at::Tensor done_seq,
+                       int64_t max_fill, int64_t n_experts, int64_t blob) {
+    TORCH_CHECK(ids.scalar_type() == at::kInt && ids.is_contiguous());
+    int E = (int)n_experts, S = (int)slot_key.numel();
+    if (S == 0 || ids.numel() == 0) return;
+    auto& q = queue_of(ids);
+    int mf = (int)std::min<int64_t>(std::min<int64_t>(max_fill, 16), pf_slot.numel());
+    int* plan = reinterpret_cast<int*>(plans.data_ptr()) + (size_t)layer * (4 + 2 * E);
+    launch_ensure(q, ids.data_ptr<int>(), (int)ids.numel(), (int)layer, E, S, ptrs_all.data_ptr<int64_t>(),
+                  slot_of.data_ptr<int>(), slot_key.data_ptr<int>(), slot_last.data_ptr<int>(), tick.data_ptr<int>(),
+                  host_base.data_ptr<int64_t>(), slot_base, blob, nullptr, pf_list.data_ptr<int>(), mf,
+                  pf_slot.data_ptr<int>(), plan, plan_seq.data_ptr<int>(), pend.data_ptr<int>(), done_seq.data_ptr<int>(),
+                  (int)done_seq.numel());
+}
+
 
 // Prefetch gather copy: WG per (prefetch entry i, 64 KiB chunk), 16 threads x 4 KiB, host USM -> device slot.
 struct PrefetchCopyKernel {
@@ -1001,7 +1155,8 @@ at::Tensor moe_forward(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, at:
 at::Tensor moe_forward_cached(at::Tensor x, at::Tensor topk_ids, at::Tensor topk_w, at::Tensor ptrs_all, int64_t layer,
                               at::Tensor slot_of, at::Tensor slot_key, at::Tensor slot_last, at::Tensor tick,
                               at::Tensor host_base, int64_t slot_base, at::Tensor fill_all, at::Tensor fill_list,
-                              int64_t max_fill, int64_t I, int64_t K, int64_t n_experts) {
+                              int64_t max_fill, int64_t I, int64_t K, int64_t n_experts, at::Tensor pend,
+                              at::Tensor done_seq) {
     TORCH_CHECK(ptrs_all.scalar_type() == at::kLong && fill_all.scalar_type() == at::kLong && slot_of.scalar_type() == at::kInt);
     int E = (int)n_experts, M = x.size(0);
     int64_t* pa = ptrs_all.data_ptr<int64_t>();
@@ -1014,7 +1169,9 @@ at::Tensor moe_forward_cached(at::Tensor x, at::Tensor topk_ids, at::Tensor topk
     launch_ensure(q, topk_ids.data_ptr<int>(), M * (int)topk_ids.size(1), (int)layer, E, (int)slot_key.numel(), pa,
                   slot_of.data_ptr<int>(), slot_key.data_ptr<int>(), slot_last.data_ptr<int>(), tick.data_ptr<int>(),
                   host_base.data_ptr<int64_t>(), slot_base, (int64_t)gm.blob(), fa, fill_list.data_ptr<int>(),
-                  (int)std::min<int64_t>(max_fill, E));
+                  (int)std::min<int64_t>(max_fill, E), nullptr, nullptr, nullptr,
+                  pend.numel() ? pend.data_ptr<int>() : nullptr, done_seq.numel() ? done_seq.data_ptr<int>() : nullptr,
+                  (int)done_seq.numel());
     return moe_forward_impl(x, topk_ids, topk_w, nullptr, ptrs_l, I, K, n_experts, fa + layer * E, pa + layer * E,
                             fa + layer * E, fill_list.data_ptr<int>());
 }
@@ -1114,12 +1271,19 @@ TORCH_LIBRARY(exl3xpu_moe, m) {
     m.impl("moe_forward", torch::kXPU, &moe::moe_forward);
     m.def("moe_forward_cached(Tensor x, Tensor topk_ids, Tensor topk_w, Tensor(a!) ptrs_all, int layer, Tensor(b!) slot_of, "
           "Tensor(c!) slot_key, Tensor(d!) slot_last, Tensor(e!) tick, Tensor host_base, int slot_base, Tensor(f!) fill_all, "
-          "Tensor(g!) fill_list, int max_fill, int I, int K, int n_experts) -> Tensor");
+          "Tensor(g!) fill_list, int max_fill, int I, int K, int n_experts, Tensor(h!) pend, Tensor done_seq) -> Tensor");
     m.impl("moe_forward_cached", torch::kXPU, &moe::moe_forward_cached);
     m.def("moe_prefetch(Tensor ids, Tensor(a!) ptrs_all, int layer, Tensor(b!) slot_of, Tensor(c!) slot_key, "
           "Tensor(d!) slot_last, Tensor tick, Tensor host_base, int slot_base, Tensor(e!) pf_list, Tensor(f!) pf_slot, "
           "int max_fill, int n_experts, int blob) -> ()");
     m.impl("moe_prefetch", torch::kXPU, &moe::moe_prefetch);
+    m.def("moe_prefetch_plan(Tensor ids, Tensor(a!) ptrs_all, int layer, Tensor(b!) slot_of, Tensor(c!) slot_key, "
+          "Tensor(d!) slot_last, Tensor tick, Tensor host_base, int slot_base, Tensor(e!) pf_list, Tensor(f!) pf_slot, "
+          "Tensor(g!) plans, Tensor(h!) plan_seq, Tensor(i!) pend, Tensor done_seq, int max_fill, int n_experts, int blob) -> ()");
+    m.impl("moe_prefetch_plan", torch::kXPU, &moe::moe_prefetch_plan);
+    m.def("moe_prefetch_worker_start(Tensor plans, Tensor host_base_cpu, int slot_base, int blob, Tensor ptrs_all, "
+          "Tensor slot_last, Tensor commit_host, Tensor done_seq, int n_layers, int n_experts) -> ()", &moe::moe_prefetch_worker_start);
+    m.def("moe_prefetch_worker_stop() -> int[]", &moe::moe_prefetch_worker_stop);
     m.def("moe_align(Tensor topk_ids, Tensor topk_w, int n_experts, int pad) -> Tensor[]");
     m.impl("moe_align", torch::kXPU, &moe::moe_align);
     m.def("host_alloc(int nbytes) -> Tensor", &moe::host_alloc);
