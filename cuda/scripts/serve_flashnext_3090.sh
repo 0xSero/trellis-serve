@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Qwen3.8-Flash-Next EXL3 (3.05bpw_h5_ng5) on ONE RTX 3090 through SGLang + trellis-serve.
 # Default (best, 2026-09-29): routed experts in pinned host memory + a global GPU expert cache (kernel lane K05,
-#   SGLANG_EXL3_MOE_OFFLOAD=gpu_cache, 9.2 GB = 4,939 slots), token embedding + EXL3 n-gram table in pinned host memory,
+#   SGLANG_EXL3_MOE_OFFLOAD=gpu_cache, 9.2 GB = 4,939 slots), token embedding in pinned host memory, EXL3 n-gram table on
+#   NVMe behind a 4 GB RAM row cache (SGLANG_EXL3_NGRAM_TIER=nvme; =pinned keeps all 32.6 GB in pinned RAM, +4 % prefill),
 #   fp8 e4m3 KV for 210k tokens (context 204,800), 8k prefill chunks, decode CUDA graphs.
 # Fallback: SGLANG_EXL3_MOE_OFFLOAD=cpu (exllamav3 CPU worker, graph-safe handoff) with CHUNK=16384 CTX=262144
 #   MAXTOK=270336 MEMFRAC=0.80 SGLANG_EXL3_EMBED_HOST=0.
@@ -28,8 +29,9 @@ ARGV=(docker run --rm --name "$NAME" --gpus "device=$GPU" --ipc=host --shm-size 
   -e HF_HUB_OFFLINE=1 -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e SGLANG_EXL3_MODEL_PATH=/models/$MODEL
   -e SGLANG_EXL3_MOE_OFFLOAD=${SGLANG_EXL3_MOE_OFFLOAD:-gpu_cache} -e EXL3_MOE_CPU_THREADS=${THREADS:-24}
   -e SGLANG_EXL3_EXPERT_CACHE_GB=${CACHE_GB:-9.2} -e SGLANG_EXL3_EMBED_HOST=${SGLANG_EXL3_EMBED_HOST:-1}
+  -e SGLANG_EXL3_NGRAM_TIER=${SGLANG_EXL3_NGRAM_TIER:-nvme}
   -e PYTHONPATH=/opt/trellis-serve/cuda/csrc/build/lib -e SGLANG_EXL3_JIT_DIR=/opt/trellis-serve/cuda/csrc/build/jit
-  $(env | grep -E "^(SGLANG_|EXL3_|PYTORCH_CUDA_ALLOC_CONF=)" | grep -v -E "^(SGLANG_EXL3_MOE_OFFLOAD|EXL3_MOE_CPU_THREADS|SGLANG_EXL3_EXPERT_CACHE_GB|SGLANG_EXL3_EMBED_HOST)=" | sed "s/^/-e /" | tr "\n" " ")
+  $(env | grep -E "^(SGLANG_|EXL3_|PYTORCH_CUDA_ALLOC_CONF=)" | grep -v -E "^(SGLANG_EXL3_MOE_OFFLOAD|EXL3_MOE_CPU_THREADS|SGLANG_EXL3_EXPERT_CACHE_GB|SGLANG_EXL3_EMBED_HOST|SGLANG_EXL3_NGRAM_TIER)=" | sed "s/^/-e /" | tr "\n" " ")
   ${DOCKER_ENV:-}
   -v "$HOME/models:/models:ro" -v "$TS:/opt/trellis-serve" -v "$HOME/freetoken-exl3:/w"
   --entrypoint bash "$IMAGE" -c "$INNER")
