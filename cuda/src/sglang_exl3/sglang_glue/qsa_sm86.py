@@ -14,6 +14,7 @@ import os
 import torch
 
 _DEBUG = os.environ.get("SGLANG_EXL3_CPU_MOE_DEBUG", "0") == "1"
+_TRITON = os.environ.get("SGLANG_EXL3_QSA_TRITON", "1") == "1"      # split-K Triton decode kernel (else torch)
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,16 @@ def varlen_decode_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     """q [B, Hq, D] (one row per sequence), k/v packed [N, Hkv, D], cu_seqlens_k [B+1] -> [B, Hq, D]."""
     if max_seqlen_q != 1:
         raise NotImplementedError("sm_86 QSA varlen fallback handles decode rows (max_seqlen_q == 1) only")
+    B, Hq, D = q.shape
+    if _TRITON:
+        from .qsa_decode_triton import qsa_decode_attention
+        return qsa_decode_attention(q, k, v, cu_seqlens_k, max_seqlen_k,
+                                    softmax_scale if softmax_scale is not None else D ** -0.5)
+    return varlen_decode_attention_torch(q, k, v, cu_seqlens_k, max_seqlen_k, softmax_scale)
+
+
+def varlen_decode_attention_torch(q, k, v, cu_seqlens_k, max_seqlen_k, softmax_scale=None):
+    """Reference torch implementation (fp32)."""
     B, Hq, D = q.shape
     Hkv = k.shape[1]
     G = Hq // Hkv
