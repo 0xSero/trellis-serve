@@ -336,3 +336,29 @@ def install_prefill_hints() -> None:
 
     cls.get_new_batch_prefill = get_new_batch_prefill
     cls._exl3_ngram_hint = True
+
+    # request arrival: warm the first chunk as soon as the tokenized request is queued (before scheduling)
+    if os.environ.get("SGLANG_EXL3_NGRAM_HINT_ARRIVAL", "1") != "0" and hasattr(cls, "_add_request_to_queue"):
+        orig_add = cls._add_request_to_queue
+
+        def _add_request_to_queue(self, req, *a, **k):
+            out = orig_add(self, req, *a, **k)
+            try:
+                if not getattr(req, "_exl3_ngram_hinted", False):
+                    from .ngram_host import _TABLES
+                    tabs = [t for t in _TABLES.values() if isinstance(t, Exl3NgramNvmeTable)]
+                    if tabs:
+                        tab = tabs[0]
+                        req._exl3_ngram_hinted = True
+                        size = int(getattr(self, "chunked_prefill_size", 0) or 8192)
+                        ids = list(req.origin_input_ids)[:size]
+                        if ids:
+                            eos = getattr(tab, "eos_token_id", None)
+                            tab.hint_tokens(ids, history=[eos, eos], eos=eos)
+            except Exception as e:
+                if not _HINT_WARNED[0]:
+                    _HINT_WARNED[0] = True
+                    logger.warning("n-gram NVMe arrival hint disabled after error: %r", e)
+            return out
+
+        cls._add_request_to_queue = _add_request_to_queue
