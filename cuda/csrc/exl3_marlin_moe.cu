@@ -764,6 +764,34 @@ void moe_set_grid_limit(int64_t n) {
   trellis_exl3_marlin_moe::g_grid_limit = (int)n;
 }
 
+// Host-side scatter copy for the expert store loader: entry j = (src_off, dst_addr, rows, row_bytes, dst_stride) copies
+// `rows` rows of `row_bytes` from src + src_off (contiguous) to dst_addr + r * dst_stride. Split over `threads` std::threads;
+// the binding releases the GIL, so the reader thread keeps streaming the next group meanwhile.
+#include <thread>
+#include <cstring>
+void host_scatter_copy(const at::Tensor& src, const at::Tensor& entries, int64_t threads) {
+  TORCH_CHECK(src.device().is_cpu() && src.dtype() == at::kByte && src.is_contiguous());
+  TORCH_CHECK(entries.device().is_cpu() && entries.dtype() == at::kLong && entries.dim() == 2 && entries.size(1) == 5 &&
+              entries.is_contiguous());
+  const uint8_t* s = src.data_ptr<uint8_t>();
+  const int64_t n = entries.size(0), nbytes = src.numel();
+  const int64_t* E = entries.data_ptr<int64_t>();
+  for (int64_t j = 0; j < n; j++)
+    TORCH_CHECK(E[5 * j] >= 0 && E[5 * j] + E[5 * j + 2] * E[5 * j + 3] <= nbytes, "host_scatter_copy: source out of range");
+  auto work = [&](int64_t a, int64_t b) {
+    for (int64_t j = a; j < b; j++) {
+      const int64_t so = E[5 * j], rows = E[5 * j + 2], rb = E[5 * j + 3], ds = E[5 * j + 4];
+      uint8_t* d = reinterpret_cast<uint8_t*>(E[5 * j + 1]);
+      if (ds == rb) std::memcpy(d, s + so, rows * rb);
+      else for (int64_t r = 0; r < rows; r++) std::memcpy(d + r * ds, s + so + r * rb, rb);
+    }
+  };
+  const int64_t T = std::max<int64_t>(1, std::min<int64_t>(threads, n));
+  std::vector<std::thread> pool;
+  for (int64_t t = 0; t < T; t++) pool.emplace_back(work, n * t / T, n * (t + 1) / T);
+  for (auto& th : pool) th.join();
+}
+
 // The same host memory seen as a CUDA tensor (same sizes / strides / dtype, UVA device address): torch ops on it read
 // host memory from the SMs over PCIe (zero-copy). Keeps the host tensor alive.
 at::Tensor host_as_cuda(const at::Tensor& t, int64_t device) {
@@ -905,6 +933,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("host_unregister", &host_unregister, "cudaHostUnregister");
   m.def("host_device_ptr", &host_device_ptr, "device (UVA) address of pinned+mapped host memory");
   m.def("host_as_cuda", &host_as_cuda, "pinned+mapped host tensor viewed as a CUDA tensor (zero-copy)");
+  m.def("host_scatter_copy", &host_scatter_copy, "threaded host scatter copy (expert store loader), GIL released",
+        py::arg("src"), py::arg("entries"), py::arg("threads") = 8, py::call_guard<py::gil_scoped_release>());
   m.def("moe_init_device", &moe_init_device, "allocate per-device state (locks, fp32 reduce scratch)");
   m.def("moe_set_gridstride_blocks", &moe_set_gridstride_blocks,
         "knob: -1 = automatic (default), 0 = one 32-thread block per (row, 128-block) item in the per-slot transforms, n > 0 = n grid-strided 256-thread blocks");

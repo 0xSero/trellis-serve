@@ -130,7 +130,13 @@ class Exl3Config(QuantizationConfig):
         if FusedMoE and isinstance(layer, FusedMoE):
             from .moe import Exl3MoEMethod
             experts = {k: v for k, v in self.modules.items() if _expert_of(k, prefix)}
-            return Exl3MoEMethod(self, prefix, experts) if experts else None
+            if not experts:
+                return None
+            # SGLANG_EXL3_MOE_OFFLOAD=1: main-model routed experts in pinned host memory + global GPU expert cache
+            if os.environ.get("SGLANG_EXL3_MOE_OFFLOAD", "0") == "1" and not prefix.startswith("mtp"):
+                from .offload_moe_method import Exl3OffloadMoEMethod
+                return Exl3OffloadMoEMethod(self, prefix, experts)
+            return Exl3MoEMethod(self, prefix, experts)
         if isinstance(layer, ParallelLMHead):
             info = self.lookup(prefix)
             return Exl3LinearMethod(prefix, [info]) if info else None
