@@ -1129,6 +1129,43 @@ def _patch_xpu_fp8_extend() -> None:
         logger.warning("exl3xpu: fp8 extend patch failed (%s)", e)
 
 
+def _cuda_compat_shim() -> None:
+    """SGLang's qwen4_exp / hyperconnection / QSA code calls a few torch.cuda.* helpers directly (device placement,
+    side streams, empty_cache). On an XPU-only torch they raise; map them onto torch.xpu (only when CUDA is absent)."""
+    if torch.cuda.is_available() or not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+        return
+    c = torch.cuda
+    if getattr(c, "_exl3_xpu_shim", False):
+        return
+    c.current_device = lambda: torch.device("xpu", torch.xpu.current_device())
+    c.current_stream = lambda device=None: torch.xpu.current_stream()
+    c.stream = torch.xpu.stream
+    c.Stream = torch.xpu.Stream
+    c.Event = torch.xpu.Event
+    c.empty_cache = torch.xpu.empty_cache
+    c.synchronize = lambda device=None: torch.xpu.synchronize()
+    if hasattr(torch.xpu, "is_current_stream_capturing"):
+        c.is_current_stream_capturing = torch.xpu.is_current_stream_capturing
+    else:
+        c.is_current_stream_capturing = lambda: False
+    c._exl3_xpu_shim = True
+    # MultiPlatformOp subclasses that only implement forward_cuda (QSA indexer) dispatch XPU to forward_native, which
+    # raises: use forward_cuda instead -- those bodies guard their CUDA-only kernels with tensor.is_cuda checks.
+    try:
+        from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+        native = MultiPlatformOp.forward_native
+
+        def forward_xpu(self, *a, **k):
+            if type(self).forward_native is native:
+                return self.forward_cuda(*a, **k)
+            return self.forward_native(*a, **k)
+        MultiPlatformOp.forward_xpu = forward_xpu
+    except ImportError:  # pragma: no cover
+        pass
+    logger.info("exl3xpu: torch.cuda.{current_device,current_stream,stream,Stream,Event,empty_cache,synchronize,"
+                "is_current_stream_capturing} mapped to torch.xpu (XPU-only torch)")
+
+
 def activate() -> None:
     """sglang.srt.plugins entry point."""
     global _done
@@ -1148,6 +1185,8 @@ def activate() -> None:
             add_quantization_method_choices(["exl3"])
     except Exception as e:  # pragma: no cover
         logger.warning("exl3xpu: could not add 'exl3' to --quantization choices (%s)", e)
+    if os.environ.get("EXL3_CUDA_SHIM", "1") == "1":
+        _cuda_compat_shim()
     if os.environ.get("EXL3_NGRAM_HOST", "1") == "1":
         # Qwen3.8-Flash-Next EXL3 n-gram table: USM host memory + zero-copy gather/decode (ngram_host.py)
         try:
