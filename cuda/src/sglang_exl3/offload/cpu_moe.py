@@ -38,6 +38,8 @@ DEV_ROWS = int(os.environ.get("SGLANG_EXL3_CPU_MOE_DEV_ROWS", "32"))
 _TIMEOUT_NS = int(float(os.environ.get("SGLANG_EXL3_CPU_MOE_TIMEOUT_S", "120")) * 1e9)
 
 _DEBUG = os.environ.get("SGLANG_EXL3_CPU_MOE_DEBUG", "0") == "1"
+# diagnostic only: routed experts contribute zero (no CPU work) -> measures the non-expert decode/prefill cost
+_NULL = os.environ.get("SGLANG_EXL3_MOE_NULL", "0") == "1"
 _METHODS: list = []          # every Exl3CpuMoEMethod built for this model (registration count)
 _STATE = {"host": None, "registered": 0, "dev": None}
 
@@ -219,7 +221,7 @@ class Exl3CpuMoEMethod(FusedMoEMethodBase):
     # ---- forward
     def _experts(self, layer, x, ids, w):
         rows = x.shape[0]
-        if rows == 0:
+        if rows == 0 or _NULL:
             return torch.zeros_like(x)
         d = _STATE["dev"]
         if rows <= min(DEV_ROWS, d.cap_rows):

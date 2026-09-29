@@ -81,6 +81,29 @@ def _patch_host_embedding() -> None:
 
     cls._build_embed_tokens, cls._exl3_host_embed = _build_embed_tokens, True
 
+    # Qwen4-Exp (Qwen3.8-Flash-Next) overrides _build_embed_tokens: same treatment (1.27 GB bf16 table -> host)
+    try:
+        from sglang.srt.models import qwen4_exp as q4
+    except Exception:  # pragma: no cover
+        return
+    cls4 = q4.Qwen4ExpModel
+    if getattr(cls4, "_exl3_host_embed", False):
+        return
+    orig4 = cls4._build_embed_tokens
+
+    def _build_embed_tokens4(self, config):
+        emb = orig4(self, config)
+        if not isinstance(emb, VocabParallelEmbedding) or HOST_EMBEDS:
+            return emb
+        emb.weight_scale = None
+        host = Qwen4ExpPinnedHostEmbedding(emb, backend="pinned")
+        HOST_EMBEDS.append(host)
+        logger.info("sglang-exl3: qwen4_exp token embedding %s kept in pinned host memory (%.2f GB)",
+                    tuple(host.weight.shape), host.weight.numel() * host.weight.element_size() / 2**30)
+        return host
+
+    cls4._build_embed_tokens, cls4._exl3_host_embed = _build_embed_tokens4, True
+
 
 def _patch_mtp_fc() -> None:
     """The Qwen3.5 MTP draft builds `self.fc = nn.Linear(2h, h)`; EXL3 checkpoints quantize `mtp.fc`. Replace it
