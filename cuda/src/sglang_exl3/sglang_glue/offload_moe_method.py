@@ -130,6 +130,15 @@ class Exl3OffloadMoEMethod(Exl3MoEMethod):
             capture = False
         # capture mode (or stream capture): decode path only - no host sync, graph-safe
         y = rt.forward(layer.exl3_store_index, x, topk_ids, topk_weights, force="decode" if capture else None)
+        if (os.environ.get("SGLANG_EXL3_OFFLOAD_LOG_PREFILL", "1") == "1" and layer.exl3_store_index == 0
+                and x.shape[0] >= rt.prefill_min_tokens and not torch.cuda.is_current_stream_capturing()):
+            # eager prefill of a new request: report (and reset) the decode hit rate accumulated since the last one
+            # (decode runs inside CUDA graphs, where no Python code executes)
+            s = rt.stats(reset=True)
+            if sum(s["decode_hits"]) + sum(s["decode_misses"]):
+                logger.info("EXL3 offload: decode hit rate %.4f since last prefill (%d hits, %d misses), resident %d/%d",
+                            s["decode_hit_rate"], sum(s["decode_hits"]), sum(s["decode_misses"]), s["resident"],
+                            s["slots"])
         if self._stats_every and layer.exl3_store_index == 0 and x.shape[0] < rt.prefill_min_tokens \
                 and not torch.cuda.is_current_stream_capturing():
             self._calls += 1

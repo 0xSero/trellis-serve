@@ -24,6 +24,7 @@ def activate() -> None:
     if "exl3" not in QUANTIZATION_CHOICES:
         add_quantization_method_choices(["exl3"])
     _patch_mtp_fc()
+    _patch_qwen4_mtp()
     _patch_dflash_exl3_draft()
     if os.environ.get("SGLANG_EXL3_EMBED_HOST", "0") == "1":
         _patch_host_embedding()
@@ -111,13 +112,15 @@ def _patch_host_embedding() -> None:
     except Exception:  # pragma: no cover
         return
     cls4 = q4.Qwen4ExpModel
-    if getattr(cls4, "_exl3_host_embed", False):
+    if "_exl3_host_embed" in cls4.__dict__:        # (the flag set on Qwen3_5ForCausalLM above is inherited)
         return
     orig4 = cls4._build_embed_tokens
 
     def _build_embed_tokens4(self, config):
+        if HOST_EMBEDS:                  # the MTP draft (built second): share the target's host table, allocate nothing
+            return HOST_EMBEDS[0]
         emb = orig4(self, config)
-        if not isinstance(emb, VocabParallelEmbedding) or HOST_EMBEDS:
+        if not isinstance(emb, VocabParallelEmbedding):
             return emb
         emb.weight_scale = None
         host = Qwen4ExpPinnedHostEmbedding(emb, backend="pinned")
@@ -186,6 +189,77 @@ def _patch_mtp_fc() -> None:
         orig_set(self, embed, head)
         if head is not None and head.dim() == 2 and head.shape[1] == 0:
             _install_hot_head(self)
+
+    cls.__init__, cls.load_weights, cls.set_embed_and_head, cls._exl3_patched = __init__, load_weights, set_embed_and_head, True
+
+
+def _patch_qwen4_mtp() -> None:
+    """Qwen4-Exp (Qwen3.8-Flash-Next) MTP draft with an EXL3 checkpoint:
+    - `fc_embedding` / `fc_hidden` are EXL3 in the checkpoint but plain nn.Linear in SGLang -> Exl3Dense;
+    - the draft's final hyper-connection mixer ships in `mtp_hyper_connection_mixer_patch.safetensors` (not in the
+      index) -> appended to the weight stream if the loader did not deliver it;
+    - the draft shares the target's EXL3 lm_head MODULE (the target's `.weight` is a zero-width placeholder), full
+      vocabulary, no hot-token map needed."""
+    try:
+        from sglang.srt.models import qwen4_exp_mtp as m
+    except Exception as e:  # pragma: no cover
+        logger.info("sglang-exl3: qwen4_exp MTP shim not installed (%s)", e)
+        return
+    cls = m.Qwen4ExpForCausalLMMTP
+    if "_exl3_patched" in cls.__dict__:
+        return
+    orig_init, orig_load, orig_set = cls.__init__, cls.load_weights, cls.set_embed_and_head
+
+    def __init__(self, config, quant_config=None, prefix=""):
+        orig_init(self, config, quant_config, prefix)
+        from .sglang_glue.config import Exl3Config
+        from .sglang_glue.linear import Exl3Dense
+        qc = getattr(self, "quant_config", quant_config)
+        self._exl3_dense = []
+        if isinstance(qc, Exl3Config):
+            self._exl3_model_path = qc.model_path
+            for name in ("fc_embedding", "fc_hidden", "fc"):
+                lin = getattr(self, name, None)
+                info = qc.lookup(f"mtp.{name}")
+                if isinstance(lin, torch.nn.Linear) and info is not None:
+                    setattr(self, name, Exl3Dense(lin.in_features, lin.out_features, info, f"mtp.{name}",
+                                                  params_dtype=lin.weight.dtype))
+                    self._exl3_dense.append(name)
+            if self._exl3_dense:
+                logger.info("sglang-exl3: qwen4_exp MTP %s replaced by EXL3 linears", self._exl3_dense)
+
+    def load_weights(self, weights, *a, **k):
+        seen = set()
+
+        def stream():
+            for n, w in weights:
+                seen.add(n)
+                yield n, w
+            path = getattr(self, "_exl3_model_path", None)
+            fn = os.path.join(path, "mtp_hyper_connection_mixer_patch.safetensors") if path else None
+            if fn and os.path.exists(fn):
+                from safetensors import safe_open
+                with safe_open(fn, "pt", device="cpu") as f:
+                    extra = [n for n in f.keys() if n not in seen]
+                    for n in extra:
+                        yield n, f.get_tensor(n)
+                if extra:
+                    logger.info("sglang-exl3: qwen4_exp MTP mixer patch: %d tensors from %s", len(extra), fn)
+        out = orig_load(self, stream(), *a, **k)
+        for name in getattr(self, "_exl3_dense", []):
+            getattr(self, name).process_weights_after_loading()
+        return out
+
+    def set_embed_and_head(self, embed, head):
+        from .sglang_glue.linear import TARGET_LM_HEADS
+        if head is not None and head.dim() == 2 and head.shape[1] == 0 and TARGET_LM_HEADS:
+            self.lm_head = TARGET_LM_HEADS[-1]           # share the target's EXL3 head module
+            head = None
+            logger.info("sglang-exl3: qwen4_exp MTP draft shares the target EXL3 lm_head")
+        if embed is not None and not embed.is_cuda and HOST_EMBEDS:
+            self.model.embed_tokens = HOST_EMBEDS[0]
+            embed = None
+        return orig_set(self, embed, head)
 
     cls.__init__, cls.load_weights, cls.set_embed_and_head, cls._exl3_patched = __init__, load_weights, set_embed_and_head, True
 

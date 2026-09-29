@@ -298,7 +298,8 @@ def install_prefill_hints() -> None:
                 if req is not None:
                     # next chunk of the request being chunked
                     ids = list(req.origin_input_ids)
-                    start = len(req.fill_ids)
+                    # SGLang 0.5.20: Req.get_fill_ids() (up to the scheduled chunk's end); older: Req.fill_ids
+                    start = len(req.get_fill_ids()) if hasattr(req, "get_fill_ids") else len(req.fill_ids)
                     if 0 < start < len(ids):
                         hist = ([eos, eos] + ids[:start])[-2:]
                         tab.hint_tokens(ids[start:start + size], history=hist, eos=eos)
