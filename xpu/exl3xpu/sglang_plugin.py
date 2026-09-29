@@ -119,6 +119,9 @@ def _unpack_signs(packed: torch.Tensor) -> torch.Tensor:
 _MOE_STORE = None
 _MOE_HOT = None
 _MOE_CACHE = os.environ.get("EXL3_MOE_CACHE", "0") == "1"
+_STAGE_MIN_M = int(os.environ.get("EXL3_MOE_STAGE_MIN_M", "512"))   # >= rows: prefill layer streaming (0 = off)
+if _STAGE_MIN_M <= 0:
+    _STAGE_MIN_M = 1 << 30
 
 
 def _moe_store(H: int, I: int, K: int, n_experts: int):
@@ -487,7 +490,14 @@ def _build_classes():
             x = dispatch_output.hidden_states
             tk = dispatch_output.topk_output
             flat = x.reshape(-1, x.shape[-1])
-            fwd = layer.exl3_moe_store.forward_cached if _MOE_CACHE else layer.exl3_moe_store.forward
+            store = layer.exl3_moe_store
+            if flat.shape[0] >= _STAGE_MIN_M and not torch.xpu.is_current_stream_capturing() \
+                    and not self.key.startswith("mtp."):
+                # prefill: stream the layer's non-resident experts through the copy engine (double buffer)
+                fwd = store.forward_prefill_staged
+            else:
+                store.prefill_reset()
+                fwd = store.forward_cached if _MOE_CACHE else store.forward
             y = fwd(self.key, flat, tk.topk_ids.reshape(flat.shape[0], -1), tk.topk_weights.reshape(flat.shape[0], -1))
             return StandardCombineInput(hidden_states=y.view_as(x))
 
@@ -1196,6 +1206,12 @@ def activate() -> None:
             print("EXL3 qsa_xpu installed", file=_sys.stderr, flush=True)
         except Exception as e:  # pragma: no cover
             logger.warning("exl3xpu: QSA XPU shim not installed (%s)", e)
+    if os.environ.get("EXL3_MODTIME", "0") == "1":
+        try:
+            from . import modtime
+            modtime.install()
+        except Exception as e:  # pragma: no cover
+            logger.warning("exl3xpu: modtime not installed (%s)", e)
     if os.environ.get("EXL3_NGRAM_HOST", "1") == "1":
         # Qwen3.8-Flash-Next EXL3 n-gram table: USM host memory + zero-copy gather/decode (ngram_host.py)
         try:

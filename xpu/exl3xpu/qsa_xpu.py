@@ -63,9 +63,53 @@ def qsa_sparse_attention_reference(q: torch.Tensor, k_cache: torch.Tensor, v_cac
     return out
 
 
+_DENSE_MIN_ROWS = int(os.environ.get("EXL3_QSA_DENSE_MIN_ROWS", "64"))
+_DENSE_SCORE_BYTES = int(os.environ.get("EXL3_QSA_DENSE_BYTES", str(384 << 20)))
+
+
+def qsa_sparse_attention_union(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                               token_slots: torch.Tensor, softmax_scale: Optional[float] = None) -> torch.Tensor:
+    """Exactly the sparse attention, computed as dense attention over the UNION of the selected slots with every
+    non-selected (row, key) pair masked to -inf: K/V gathered once per call instead of once per query row, bf16 GEMMs.
+    Prefill only (data-dependent union size -> host sync, not capturable)."""
+    scale = softmax_scale or q.shape[-1] ** -0.5
+    R, Hq, D = q.shape
+    Hk = k_cache.shape[1]
+    G = Hq // Hk
+    valid = token_slots >= 0
+    uni = torch.unique(token_slots[valid])                          # sorted physical slots
+    nu = int(uni.numel())
+    out = torch.zeros_like(q)
+    if nu == 0:
+        return out
+    # invalid (-1) entries go to a spare column nu (dropped): writing them anywhere real could clear a selected key
+    col = torch.where(valid, torch.searchsorted(uni, token_slots.clamp_min(0).to(uni.dtype)),
+                      torch.full_like(token_slots, nu, dtype=torch.long))
+    kk = k_cache.index_select(0, uni.long()).to(torch.bfloat16).permute(1, 2, 0).contiguous()   # [Hk, D, nu]
+    vv = v_cache.index_select(0, uni.long()).to(torch.bfloat16).transpose(0, 1).contiguous()   # [Hk, nu, D]
+    B = max(8, min(R, _DENSE_SCORE_BYTES // max(1, Hq * nu * 6)))
+    for r0 in range(0, R, B):
+        r1 = min(R, r0 + B)
+        n = r1 - r0
+        mask = torch.zeros((n, nu + 1), dtype=torch.bool, device=q.device)
+        mask.scatter_(1, col[r0:r1].long(), True)
+        mask = mask[:, :nu]
+        qq = q[r0:r1].to(torch.bfloat16).view(n, Hk, G, D).permute(1, 0, 2, 3).reshape(Hk, n * G, D)
+        sc = torch.matmul(qq, kk).view(Hk, n, G, nu).float() * scale
+        sc.masked_fill_(~mask[None, :, None, :], -float("inf"))
+        p = torch.softmax(sc, dim=-1)
+        p = torch.nan_to_num_(p, nan=0.0).to(torch.bfloat16).view(Hk, n * G, nu)
+        o = torch.matmul(p, vv).view(Hk, n, G, D).permute(1, 0, 2, 3).reshape(n, Hq, D)
+        out[r0:r1] = o.to(q.dtype)
+    return out
+
+
 def qsa_sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale=None):
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
         raise ValueError("q, k_cache and v_cache must be rank-3 tensors")
+    capturing = hasattr(torch.xpu, "is_current_stream_capturing") and torch.xpu.is_current_stream_capturing()
+    if q.shape[0] >= _DENSE_MIN_ROWS and not capturing and os.environ.get("EXL3_QSA_UNION", "1") == "1":
+        return qsa_sparse_attention_union(q, k_cache, v_cache, token_slots, softmax_scale)
     return qsa_sparse_attention_reference(q, k_cache, v_cache, token_slots, softmax_scale)
 
 
@@ -126,6 +170,32 @@ def install() -> None:
                                 setattr(c, meth, wrap)
         except Exception as e:  # pragma: no cover
             logger.warning("exl3xpu: QSA graph-metadata patch failed (%s)", e)
+    if os.environ.get("EXL3_QSA_TRITON_EXTEND", "0") == "1":   # REJECTED on B70: 2.5-6.5 s per 4k chunk (torch 2.8)
+        # Prefill: SGLang's CUDA branch of forward_extend runs Triton sparse-GQA kernels (device-agnostic); the torch
+        # fallback gathers ~2k keys per query row (~250 ms per layer per 4k chunk on the B70). Take the Triton branch
+        # on XPU too: re-define forward_extend with its `q.is_cuda` tests accepting XPU tensors.
+        try:
+            import inspect, re, textwrap
+            qb = importlib.import_module("sglang.srt.layers.attention.qwen_sparse_attn_backend")
+            if not getattr(torch.cuda, "_exl3_devname", False):
+                _orig_name = torch.cuda.get_device_name
+                torch.cuda.get_device_name = lambda *a, **k: (torch.xpu.get_device_name(0) if not torch.cuda.is_available()
+                                                              else _orig_name(*a, **k))
+                torch.cuda._exl3_devname = True
+            for name in dir(qb):
+                c = getattr(qb, name)
+                if isinstance(c, type) and "forward_extend" in c.__dict__ and not getattr(c.forward_extend, "_exl3_xpu", False):
+                    src = textwrap.dedent(inspect.getsource(c.forward_extend))
+                    new_src = re.sub(r"\bq\.is_cuda\b", '(q.device.type in ("cuda", "xpu"))', src)
+                    if new_src == src:
+                        continue
+                    ns: dict = {}
+                    exec(compile(new_src, f"<exl3xpu:{name}.forward_extend>", "exec"), qb.__dict__, ns)
+                    ns["forward_extend"]._exl3_xpu = True
+                    c.forward_extend = ns["forward_extend"]
+                    logger.info("exl3xpu: QSA %s.forward_extend uses the Triton sparse-GQA kernels on XPU", name)
+        except Exception as e:  # pragma: no cover
+            logger.warning("exl3xpu: QSA Triton extend patch failed (%s)", e)
     # Graph replay on non-CUDA devices: the backend's torch path maps logical -> physical KV slots through
     # metadata.token_slot_table, which in graph mode is a DUMMY buffer (_graph_dummy_token_slot_table, only the CUDA
     # kernels are fed through the graph page tables) and is never refreshed at replay -> full-attention layers read

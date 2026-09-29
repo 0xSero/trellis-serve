@@ -24,4 +24,13 @@ a = ref_attn(q, kc, vc, slots, 0.0625); b = qsa_xpu.qsa_sparse_attention_referen
 err = ((a.float() - b.float()).abs().max() / a.float().abs().max()).item()
 print("attn rel max err", err, "empty row zero:", b[3].abs().max().item() == 0)
 bad += err > 2e-2
+for R in (7, 300):
+    qR = torch.randn(R, Hk * G, D, device=dev, dtype=torch.bfloat16)
+    # QSA rows select DISTINCT positions (expanded complete blocks + disjoint tail); -1 padding at the end
+    sl = torch.stack([torch.randperm(N, device=dev)[:2051] for _ in range(R)]).to(torch.int32)
+    sl[:, 1800:] = -1; sl[3] = -1
+    a = ref_attn(qR, kc, vc, sl, 0.0625); c = qsa_xpu.qsa_sparse_attention_union(qR, kc, vc, sl, 0.0625)
+    e2 = ((a.float() - c.float()).abs().max() / a.float().abs().max()).item()
+    print("union attn R", R, "rel max err", e2, "empty row zero:", c[3].abs().max().item() == 0)
+    bad += e2 > 2e-2
 sys.exit(bad)

@@ -18,6 +18,7 @@ ap.add_argument("--url", default="http://127.0.0.1:30200")
 ap.add_argument("--topk", type=int, default=64)
 ap.add_argument("--no-greedy", action="store_true")
 ap.add_argument("--out", default="")
+ap.add_argument("--ctx", type=int, default=262144)
 a = ap.parse_args()
 
 
@@ -75,7 +76,9 @@ if not a.no_greedy:
     for i, it in enumerate(panel):
         toks, pl = it["tokens"], it["prompt_len"]
         t0 = time.time()
-        r = post("/generate", {"input_ids": toks[:pl], "sampling_params": {"temperature": 0}})
+        # SGLang's /generate defaults to max_new_tokens=128: pass the remaining context so generation ends naturally
+        r = post("/generate", {"input_ids": toks[:pl], "sampling_params": {"temperature": 0,
+                                                                           "max_new_tokens": a.ctx - pl}})
         dt = time.time() - t0
         out = r.get("output_ids") or []
         ref = toks[pl:]
@@ -85,8 +88,9 @@ if not a.no_greedy:
                 break
             common += 1
         g = {"i": i, "gen_tokens": len(out), "ref_tokens": len(ref), "common_prefix": common, "exact": out == ref,
-             "seconds": round(dt, 1), "text_head": r.get("text", "")[:160]}
+             "seconds": round(dt, 1), "finish": (r.get("meta_info") or {}).get("finish_reason"),
+             "text_head": r.get("text", "")[:160], "text": r.get("text", "")}
         res["greedy"].append(g)
-        print(g, flush=True)
+        print({k: v for k, v in g.items() if k != "text"}, flush=True)
 if a.out:
     json.dump(res, open(a.out, "w"), indent=1)

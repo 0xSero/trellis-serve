@@ -343,6 +343,57 @@ class ExpertStore:
         self._slot_ready_ev.clear()
         self._cache_used = False
 
+    # ---- prefill layer streaming inside a model forward (copy engine, double buffer), X004
+    def forward_prefill_staged(self, key, x: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch.Tensor) -> torch.Tensor:
+        """Prefill-size MoE for layer `key` from a device staging buffer: the layer's non-resident experts are copied
+        H2D on a side stream (copy engine) -- normally already done while the previous layer computed -- then this call
+        starts staging the NEXT layer into the other buffer. Resident experts are read from their cache slots."""
+        if not hasattr(self, "_pf"):
+            self._pf = {"stream": torch.xpu.Stream(), "buf_of": {}, "ready": {}, "free": [None, None], "order": None}
+        pf = self._pf
+        if pf["order"] is None or len(pf["order"]) != len(self.layer_index):
+            pf["order"] = list(self.layer_index)
+            pf["layers"] = [k for k in pf["order"] if not str(k).startswith("mtp.")]
+        cs = torch.xpu.current_stream()
+        li = pf["order"].index(key)
+        if key not in pf["buf_of"]:
+            used = {b for b, _ in pf["buf_of"].values()}
+            self._stage_into(key, 0 if 0 not in used else 1)
+        buf, table = pf["buf_of"].pop(key)
+        cs.wait_event(pf["ready"].pop(key))
+        ids, w = self._rt(topk_ids, topk_w)
+        y = self.X.moe_forward(x, ids, w, table, self.I, self.K, self.E)
+        ev = torch.xpu.Event()
+        ev.record(cs)
+        pf["free"][buf] = ev                          # buffer reusable once this layer's kernels are done
+        # stage the next regular layer (wrapping to the first: chunked prefill runs forwards back to back); a pre-staged
+        # table is dropped by prefill_reset() as soon as any non-staged MoE call (decode) could move cache slots
+        layers = pf["layers"]
+        pos = layers.index(key) if key in layers else -1
+        if pos >= 0 and layers:
+            nxt = layers[(pos + 1) % len(layers)]
+            if nxt not in pf["buf_of"] and nxt != key:
+                self._stage_into(nxt, 1 - buf)
+        return y
+
+    def _stage_into(self, key, buf: int) -> None:
+        pf = self._pf
+        st = pf["stream"]
+        if pf["free"][buf] is not None:
+            st.wait_event(pf["free"][buf])
+            pf["free"][buf] = None
+        table = self.stage_layer(key, buf, st)       # copies the non-resident experts on the side stream
+        ev = torch.xpu.Event()
+        ev.record(st)
+        pf["buf_of"][key] = (buf, table)
+        pf["ready"][key] = ev
+
+    def prefill_reset(self) -> None:
+        """Drop pre-staged layers (their tables hold cache-slot pointers valid only until the next cache update)."""
+        if hasattr(self, "_pf") and self._pf["buf_of"]:
+            self._pf["buf_of"].clear()
+            self._pf["ready"].clear()
+
     def sync_mirror(self) -> None:
         """Rebuild the CPU mirror (slot_of, slot_owner, free list) from the device cache state. Device->host read of
         the slot map (synchronises the current stream): for static placement ops, never in the decode loop."""

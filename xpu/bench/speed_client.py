@@ -43,7 +43,8 @@ for ctx in [int(v) for v in a.decode_ctx.split(",") if v != ""]:
     for rep in range(a.reps):
         msgs = []
         if ctx:
-            words = " ".join(f"item{random.Random(ctx + rep).randrange(10**6)}" for _ in range(ctx // 3))
+            rng = random.Random(ctx + rep)          # "itemNNNNNN" = ~7 tokens per word with this tokenizer (measured)
+            words = " ".join(f"item{rng.randrange(10**6)}" for _ in range(int(ctx / 7.0)))
             msgs.append({"role": "user", "content": "Here is a long log you can ignore:\n" + words})
             msgs.append({"role": "assistant", "content": "Understood."})
         msgs.append({"role": "user", "content": "Count from 1 to 200, separated by commas. Output only the numbers."})
