@@ -9,8 +9,11 @@ graph capture. `install()` substitutes a small graph-safe torch implementation f
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
+
+_DEBUG = os.environ.get("SGLANG_EXL3_CPU_MOE_DEBUG", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +44,12 @@ def varlen_decode_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     p = torch.softmax(s, dim=-1)
     p = torch.nan_to_num(p, nan=0.0)                                       # rows without keys (graph padding)
     o = torch.einsum("bhgt,bthd->bhgd", p, vv)
-    return o.reshape(B, Hq, D).to(q.dtype)
+    o = o.reshape(B, Hq, D).to(q.dtype)
+    if _DEBUG and not torch.cuda.is_current_stream_capturing():
+        print(f"[qsa_sm86 dbg] B {B} T {T} lens {lens.tolist()} q finite {bool(torch.isfinite(q).all())} "
+              f"k finite(valid) {bool(torch.isfinite(kk).all())} v finite(valid) {bool(torch.isfinite(vv).all())} "
+              f"out finite {bool(torch.isfinite(o).all())}", flush=True)
+    return o
 
 
 def install() -> None:
@@ -67,3 +75,25 @@ def install() -> None:
         return orig()
     qb._resolve_flash_attn_varlen_func = resolve
     qb._exl3_sm86 = True
+    if os.environ.get("SGLANG_EXL3_QSA_INDEXER_OVERLAP", "0") != "1":
+        _no_indexer_overlap()
+
+
+def _no_indexer_overlap() -> None:
+    """Run the QSA indexer on the main stream (SGLang overlaps it on alt_stream inside decode graphs). With it on,
+    decode-graph warm-up on sm_86 hangs in a QSA layer (GPU busy, all expert handoffs complete); with host syncs between
+    kernels it does not -> stream race; keep the indexer serial until that is understood."""
+    from sglang.srt.models import qwen4_exp as q
+    cls = q.Qwen4ExpAttentionDecoderLayer
+    if getattr(cls, "_exl3_serial_indexer", False):
+        return
+    orig = cls.self_attention
+
+    def self_attention(self, positions, hidden_states, forward_batch):
+        alt, self.alt_stream = self.alt_stream, None
+        try:
+            return orig(self, positions, hidden_states, forward_batch)
+        finally:
+            self.alt_stream = alt
+    cls.self_attention = self_attention
+    cls._exl3_serial_indexer = True

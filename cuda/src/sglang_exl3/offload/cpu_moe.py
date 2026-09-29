@@ -233,16 +233,18 @@ class Exl3CpuMoEMethod(FusedMoEMethodBase):
     def _device_path(self, layer, x, ids, w):
         d = _STATE["dev"]
         x = x.contiguous()
-        if _DEBUG:
-            _dbg_wait("before issue")
+        if _DEBUG and not torch.cuda.is_current_stream_capturing():
+            _dbg_wait(f"L{layer.exl3_cpu_idx} before issue rows {x.shape[0]} x finite {bool(torch.isfinite(x).all())} "
+                      f"absmax {float(x.float().abs().max()):.3g} ids [{int(ids.min())},{int(ids.max())}] "
+                      f"w finite {bool(torch.isfinite(w).all())}")
         d.ext.cpu_moe_issue(x, ids.contiguous(), w.to(torch.float32).contiguous(), d.hi, d.x, d.sel, d.w, d.base,
                             d.jobs, d.job_words, d.ring, d.data_ready, layer.exl3_cpu_idx, d.counter)
-        if _DEBUG:
+        if _DEBUG and not torch.cuda.is_current_stream_capturing():
             _dbg_wait("after issue")
         out = torch.empty_like(x)
         d.ext.cpu_moe_collect(out, d.out, d.ho, d.base, d.done, d.consumed, _TIMEOUT_NS)
-        if _DEBUG:
-            _dbg_wait("after collect")
+        if _DEBUG and not torch.cuda.is_current_stream_capturing():
+            _dbg_wait(f"after collect: out finite {bool(torch.isfinite(out).all())} absmax {float(out.float().abs().max()):.3g}")
         return out
 
     def _host_path(self, layer, x, ids, w):
