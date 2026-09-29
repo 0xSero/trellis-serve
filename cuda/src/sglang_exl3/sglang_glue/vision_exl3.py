@@ -216,6 +216,52 @@ def _patch_ple_image_ids() -> None:
     top.__init__ = __init__
 
 
+def _ln32(norm, x32):
+    return torch.nn.functional.layer_norm(x32, norm.normalized_shape, norm.weight.float(),
+                                          norm.bias.float() if norm.bias is not None else None, norm.eps)
+
+
+def install_fp32_residual() -> None:
+    """SGLANG_EXL3_VIT_FP32_RESIDUAL=1: keep the ViT residual stream (and its LayerNorms) in fp32 like exllamav3
+    (patch/pos embed out_dtype float); linears and attention still run in the tower dtype. +4 B/patch x 1152 x ~2
+    transients (~0.6 GB at 4096^2)."""
+    from einops import rearrange
+    from sglang.srt.models import qwen3_vl as m
+    if getattr(m.Qwen3_VisionBlock, "_exl3_fp32", False):
+        return
+
+    def block_forward(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, output_ws=None,
+                      forward_metadata=None, max_seqlen=None, sequence_lengths=None):
+        dt = self.norm1.weight.dtype
+        x32 = x if x.dtype == torch.float32 else x.float()
+        h = rearrange(_ln32(self.norm1, x32).to(dt), "s b ... -> b s ...")
+        attn = self.attn(h, cu_seqlens=cu_seqlens, rotary_pos_emb_cos=rotary_pos_emb_cos,
+                         rotary_pos_emb_sin=rotary_pos_emb_sin, output_ws=output_ws, forward_metadata=forward_metadata,
+                         max_seqlen=max_seqlen, sequence_lengths=sequence_lengths)
+        x32 = x32 + rearrange(attn, "b s ... -> s b ...").float()
+        del attn, h
+        x32 += self.mlp(_ln32(self.norm2, x32).to(dt)).float()
+        return x32
+
+    orig_merger = m.Qwen3VLMoeVisionPatchMerger.forward
+
+    def merger_forward(self, x):
+        if x.dtype != torch.float32:
+            return orig_merger(self, x)
+        dt = self.norm.weight.dtype
+        if self.use_postshuffle_norm:
+            x = _ln32(self.norm, x.view(-1, self.hidden_size)).to(dt)
+        else:
+            x = _ln32(self.norm, x).to(dt).view(-1, self.hidden_size)
+        y, _ = self.linear_fc1(x)
+        y, _ = self.linear_fc2(self.act_fn(y))
+        return y
+
+    m.Qwen3_VisionBlock.forward, m.Qwen3_VisionBlock._exl3_fp32 = block_forward, True
+    m.Qwen3VLMoeVisionPatchMerger.forward = merger_forward
+    logger.info("sglang-exl3: ViT residual stream in fp32")
+
+
 def install() -> None:
     try:
         from sglang.srt.models import qwen4_exp as q4
@@ -223,6 +269,8 @@ def install() -> None:
         logger.info("sglang-exl3: vision shim not installed (%s)", e)
         return
     _patch_load(q4.Qwen4ExpForConditionalGeneration)
+    if os.environ.get("SGLANG_EXL3_VIT_FP32_RESIDUAL", "0") == "1":
+        install_fp32_residual()
     if os.environ.get("SGLANG_EXL3_PLE_IMAGE_IDS", "1") == "1":
         _patch_ple_image_ids()
     logger.info("sglang-exl3: EXL3 vision tower loader installed")
