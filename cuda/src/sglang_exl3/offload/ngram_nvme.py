@@ -273,7 +273,7 @@ def install_prefill_hints() -> None:
 
     Wraps SGLang `Scheduler.get_new_batch_prefill`: after scheduling, if a request is still being chunked
     (`self.chunked_req`), its next `chunked_prefill_size` prompt tokens (after `len(req.fill_ids)`) are hashed on the
-    CPU and warmed asynchronously. Only works when the scheduler and the model worker share a process (tp_size 1).
+    CPU and warmed asynchronously; so are the first chunks of the first two waiting requests (once each). Only works when the scheduler and the model worker share a process (tp_size 1).
     A wrong or late hint costs nothing but hit rate: lookups always go through the normal graph-safe path.
     Disable with SGLANG_EXL3_NGRAM_HINT=0."""
     if os.environ.get("SGLANG_EXL3_NGRAM_HINT", "1") == "0":
@@ -287,19 +287,28 @@ def install_prefill_hints() -> None:
     def get_new_batch_prefill(self, *a, **k):
         out = orig(self, *a, **k)
         try:
-            req = getattr(self, "chunked_req", None)
-            if req is not None:
-                from .ngram_host import _TABLES
-                tabs = [t for t in _TABLES.values() if isinstance(t, Exl3NgramNvmeTable)]
-                if tabs:
-                    tab = tabs[0]
+            from .ngram_host import _TABLES
+            tabs = [t for t in _TABLES.values() if isinstance(t, Exl3NgramNvmeTable)]
+            if tabs:
+                tab = tabs[0]
+                eos = getattr(tab, "eos_token_id", None)
+                size = int(getattr(self, "chunked_prefill_size", 0) or 8192)
+                req = getattr(self, "chunked_req", None)
+                if req is not None:
+                    # next chunk of the request being chunked
                     ids = list(req.origin_input_ids)
                     start = len(req.fill_ids)
-                    size = int(getattr(self, "chunked_prefill_size", 0) or 8192)
                     if 0 < start < len(ids):
-                        eos = getattr(tab, "eos_token_id", None)
                         hist = ([eos, eos] + ids[:start])[-2:]
                         tab.hint_tokens(ids[start:start + size], history=hist, eos=eos)
+                # first chunk of the next waiting requests (each once)
+                for w in list(getattr(self, "waiting_queue", []) or [])[:2]:
+                    if getattr(w, "_exl3_ngram_hinted", False):
+                        continue
+                    w._exl3_ngram_hinted = True
+                    ids = list(w.origin_input_ids)[:size]
+                    if ids:
+                        tab.hint_tokens(ids, history=[eos, eos], eos=eos)
         except Exception as e:  # never break scheduling for a hint
             if not _HINT_WARNED[0]:
                 _HINT_WARNED[0] = True
