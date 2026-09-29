@@ -20,6 +20,7 @@ Env (read at construction):
   SGLANG_EXL3_NGRAM_IO          pread (default: O_DIRECT, 32-thread pool, ~290k IOPS on the dm-crypt 990 Pro) |
                                 aio (O_DIRECT + io_submit, one issuer, ~185k IOPS) | buffered (page cache; ~2.7M rows/s
                                 when the file is cached, but uses up to 32.6 GB of reclaimable page cache)
+  SGLANG_EXL3_NGRAM_POLICY      clock (default) | gclock (2-bit frequency CLOCK) | cold (new rows inserted unreferenced)
   SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  pread threads (32)
   SGLANG_EXL3_NGRAM_MAX_TOKENS  largest forward (tokens) one lookup may carry (default 32768 -> 524,288 ids)
   SGLANG_EXL3_NGRAM_MAX_RUN     largest coalesced read in bytes (default 65536)
@@ -119,7 +120,7 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.row_bytes = self.words * 2
         ram_gb = float(ram_gb if ram_gb is not None else _env("SGLANG_EXL3_NGRAM_RAM_GB", 8.0, float))
         io = io or _env("SGLANG_EXL3_NGRAM_IO", "pread")
-        backend = {"aio": 0, "pread": 1, "buffered": 2}[io]
+        backend = {"aio": 0, "pread": 1, "buffered": 2, "mmap": 3}[io]
         max_tokens = int(max_tokens or _env("SGLANG_EXL3_NGRAM_MAX_TOKENS", 32768, int))
         aux_names = ("head_bias", "head_offsets", "head_vocab_sizes", "layer_multipliers")
         aux = {n: _read_small(t["path"], t["base"], t["hdr"][f"{self.prefix}.{n}"]) for n in aux_names
@@ -136,6 +137,8 @@ class Exl3NgramNvmeTable(torch.nn.Module):
                                        _env("SGLANG_EXL3_NGRAM_MAX_RUN", 65536, int),
                                        _env("SGLANG_EXL3_NGRAM_MERGE_GAP", 0, int), self.cap)
         self.nslots = nslots
+        pol = _env("SGLANG_EXL3_NGRAM_POLICY", "clock")
+        self.store.set_policy({"clock": 0, "gclock": 1, "cold": 2}[pol])
         self.file_hash = {k: aux[k].long() for k in ("head_offsets", "head_vocab_sizes", "layer_multipliers")}
         self.embedding_dim = 160
         self.num_embeddings = self.num_rows

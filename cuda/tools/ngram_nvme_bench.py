@@ -170,9 +170,12 @@ def main():
     ap.add_argument("--repeat", type=int, default=1, help="replay the streams this many times (warm-cache view)")
     ap.add_argument("--corpus", default="", help="hitrate mode: comma list of dirs; *.py/*.md/*.txt/*.rst files are "
                     "tokenised as warm-up traffic before the K02 streams")
+    ap.add_argument("--io-cfgs", default="pread,32,warm")
+    ap.add_argument("--policy", type=int, default=0, help="0 CLOCK, 1 GCLOCK (2-bit), 2 CLOCK cold insertion")
     ap.add_argument("--prefill-tps", type=float, default=2500.0)
     ap.add_argument("--corpus-tokens", type=int, default=20_000_000)
     a = ap.parse_args()
+    os.environ["SGLANG_EXL3_NGRAM_POLICY"] = ["clock", "gclock", "cold"][a.policy]
     os.makedirs(a.out, exist_ok=True)
     streams = build_streams(a.model, a.workloads, a.k02)
     info = dict(requests=len(streams), prompt_tokens=sum(len(s["prompt"]) for s in streams),
@@ -239,7 +242,7 @@ def main():
             for e in tok.encode_batch(texts, add_special_tokens=False):
                 if len(e.ids) < 16:
                     continue
-                docs.append(tab0.hash_tokens(e.ids, eos=EOS).reshape(-1))
+                docs.append(np.asarray(e.ids, dtype=np.int32))
                 ntok += len(e.ids)
             if ntok >= a.corpus_tokens:
                 break
@@ -253,11 +256,12 @@ def main():
             t0 = time.time()
             marks = {}
             seen = 0
-            for d in docs:
+            for dt in docs:
+                d = tab.hash_tokens(torch.from_numpy(dt.astype(np.int64)), eos=EOS).reshape(-1)
                 for c0 in range(0, d.numel(), tab.cap):
                     tab.store.resolve(d[c0:c0 + tab.cap].contiguous(), slots)
                 seen += d.numel() // 16
-                for m in (1_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000):
+                for m in (1_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000, 150_000_000):
                     if seen >= m and m not in marks:
                         marks[m] = tab.stats(gpu=False)["lookup_hit_rate"]
             corpus_hit = tab.stats(gpu=False)["lookup_hit_rate"]
@@ -298,6 +302,44 @@ def main():
                         print(json.dumps(out[-1]), flush=True)
                 tab.release()
         res.update(hint=out)
+    elif a.mode == "io":
+        # IO mode study: cold random rows (fresh ids every rep) through the store, per backend/threads, with the page
+        # cache warm (as found) and cold (per-file POSIX_FADV_DONTNEED of the n-gram file only). dm-0 read counters
+        # before/after flag foreign IO (the plugin's Flash-Next server shares the NVMe).
+        def dm_reads():
+            try:
+                f = open("/sys/block/dm-0/stat").read().split()
+                return int(f[0]), int(f[2]) * 512
+            except Exception:
+                return 0, 0
+        out = []
+        g = torch.Generator().manual_seed(7)
+        for cfg in a.io_cfgs.split(";"):
+            io, thr, cache = cfg.split(",")
+            os.environ["SGLANG_EXL3_NGRAM_THREADS"] = thr
+            tab = make_table(a.model, 1.0, io, 16384)
+            if cache == "cold":
+                tab.store.drop_file_cache()
+            slots = torch.empty(tab.cap, dtype=torch.long)
+            for n in (16, 4096, 131072, 262144):
+                reps = {16: 300, 4096: 20, 131072: 3, 262144: 2}[n]
+                ts = []
+                d0 = dm_reads()
+                c0 = tab.stats(gpu=False)
+                for _ in range(reps):
+                    x = torch.randint(0, tab.num_rows, (n,), generator=g)
+                    t0 = time.perf_counter(); tab.store.resolve(x, slots); ts.append(time.perf_counter() - t0)
+                d1 = dm_reads()
+                c1 = tab.stats(gpu=False)
+                own = c1["bytes"] - c0["bytes"]
+                o = dict(io=io, threads=int(thr), page_cache=cache, n=n, reps=reps, ms_p50=1e3 * pct(ts, 50),
+                         ms_mean=1e3 * float(np.mean(ts)), ms_max=1e3 * float(np.max(ts)),
+                         rows_per_s=n / float(np.median(ts)), own_bytes=own, dm0_read_bytes=d1[1] - d0[1],
+                         dm0_read_ios=d1[0] - d0[0])
+                out.append(o)
+                print(json.dumps(o), flush=True)
+            tab.release()
+        res.update(io=out)
     elif a.mode == "qd":
         # cold random reads through the store: n ids per resolve, fresh rows each time
         out = []
