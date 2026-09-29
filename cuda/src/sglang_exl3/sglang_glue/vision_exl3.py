@@ -13,7 +13,7 @@ and written into SGLang's dense ViT parameters. The bf16 `qkv` leftover is dropp
 EXL3 checkpoint) is kept at the padded width, as exllamav3 computes it.
 
 VRAM: the dense tower has the same size as the (uninitialised) bf16 tower SGLang allocated before, plus the padding
-(27 x 2 x 48 x 1152 x 2 B = 6.0 MB); the decode is transient (one matrix at a time).
+(27 x 2 x 48 x 1152 x 2 B = 5.7 MiB, allocated at construction); the decode is transient (one matrix at a time).
 
 Also (independent of the checkpoint format): SGLang clamps the multimodal pad ids in `forward_batch.input_ids` to
 `vocab-1` before the language model runs; Qwen4-Exp's n-gram PLE hashes those ids, while HF/exllamav3 hash the literal
@@ -60,10 +60,9 @@ def _decode_dense(qc, key: str, tensors: dict, dtype: torch.dtype) -> tuple[torc
 
 
 def _set(param: torch.nn.Parameter, value: torch.Tensor) -> None:
-    if tuple(param.shape) == tuple(value.shape):
-        param.data.copy_(value.to(param.dtype))
-    else:                                              # padded MLP width
-        param.data = value.to(param.dtype).contiguous()
+    if tuple(param.shape) != tuple(value.shape):
+        raise ValueError(f"sglang-exl3: vision parameter {tuple(param.shape)} vs decoded {tuple(value.shape)}")
+    param.data.copy_(value.to(param.dtype))
 
 
 @torch.no_grad()
@@ -110,10 +109,36 @@ def _install_visual(model, qc, vis: dict[str, dict]) -> None:
                 before / 2**20, after / 2**20, (after - before) / 2**20, (free1 - free0) / 2**20)
 
 
+def _to_fp16(visual) -> None:
+    """Run the ViT in fp16 like exllamav3 (SGLANG_EXL3_VISION_FP16=1): same bytes; the tower's output is cast back to
+    the language model's dtype."""
+    out_dtype = visual.dtype
+    visual.half()
+    orig = visual.forward
+
+    def forward(*a, **k):
+        y = orig(*a, **k)
+        return y.to(out_dtype) if torch.is_tensor(y) else y
+    visual.forward = forward
+    logger.info("sglang-exl3: vision tower runs in fp16 (output cast to %s)", out_dtype)
+
+
 def _patch_load(cls) -> None:
     if "_exl3_vision" in cls.__dict__:
         return
-    orig_load = cls.load_weights
+    orig_load, orig_init = cls.load_weights, cls.__init__
+
+    def __init__(self, config, quant_config=None, *a, **k):
+        # build the MLP at the checkpoint's padded width (4304 -> 4352) so decoded weights drop into the parameters
+        # SGLang allocated (re-allocating 54 bigger fc1/fc2 tensors after load left ~0.5 GB of fragmented cache)
+        from .config import Exl3Config
+        vc = getattr(config, "vision_config", None)
+        if isinstance(quant_config, Exl3Config) and vc is not None:
+            info = quant_config.lookup("model.visual.blocks.0.mlp.linear_fc1")
+            if info is not None and info[1] != vc.intermediate_size:
+                logger.info("sglang-exl3: vision MLP width %d -> %d (EXL3 padded)", vc.intermediate_size, info[1])
+                vc.intermediate_size = info[1]
+        orig_init(self, config, quant_config, *a, **k)
 
     def load_weights(self, weights, *a, **k):
         from .config import Exl3Config
@@ -140,9 +165,11 @@ def _patch_load(cls) -> None:
             logger.info("sglang-exl3: %d EXL3 vision matrices intercepted, %d leftover fused qkv tensors dropped",
                         len(vis), len(dropped))
             _install_visual(self, qc, vis)
+            if os.environ.get("SGLANG_EXL3_VISION_FP16", "0") == "1":
+                _to_fp16(self.visual)
         return out
 
-    cls.load_weights, cls._exl3_vision = load_weights, True
+    cls.__init__, cls.load_weights, cls._exl3_vision = __init__, load_weights, True
 
 
 def _patch_ple_image_ids() -> None:
