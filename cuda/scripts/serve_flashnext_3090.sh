@@ -4,6 +4,9 @@
 #   SGLANG_EXL3_MOE_OFFLOAD=gpu_cache, 10.5 GB = 5,637 slots, prefill staging in 4 parts), token embedding in pinned host
 #   memory, EXL3 n-gram table on NVMe (pread x32) behind an 8 GB RAM row cache (SGLANG_EXL3_NGRAM_TIER=nvme; =pinned keeps all 32.6 GB in pinned RAM, +4 % prefill),
 #   fp8 e4m3 KV for 210k tokens (context 204,800), 8k prefill chunks, decode CUDA graphs.
+# Vision (images 256^2 .. 4096^2): EXL3 ViT decoded to bf16 at load (SGLANG_EXL3_VISION=1, plugin default), image
+#   preprocessing on CPU (SGLANG_EXL3_MM_FAST_CPU=1), per-image SDPA ViT attention (SGLANG_EXL3_VIT_SDPA=1), ViT MLP in
+#   8192-row chunks (SGLANG_EXL3_VIT_MLP_CHUNK=8192); without the last three a 4096^2 image OOMs (VIS003).
 # Fallback: SGLANG_EXL3_MOE_OFFLOAD=cpu (exllamav3 CPU worker, graph-safe handoff) with CHUNK=16384 CTX=262144
 #   MAXTOK=270336 MEMFRAC=0.80 SGLANG_EXL3_EMBED_HOST=0.
 # Foreground (run it under bench/gpu1_run.sh in tmux so the GPU lock is held exactly as long as the server lives):
@@ -32,8 +35,9 @@ ARGV=(docker run --rm --name "$NAME" --gpus "device=$GPU" --ipc=host --shm-size 
   -e SGLANG_EXL3_OFFLOAD_STAGING_PARTS=${SGLANG_EXL3_OFFLOAD_STAGING_PARTS:-4} -e SGLANG_EXL3_OFFLOAD_FUSED=${SGLANG_EXL3_OFFLOAD_FUSED:-1}
   -e SGLANG_EXL3_OFFLOAD_COMPACT_PARTS=${SGLANG_EXL3_OFFLOAD_COMPACT_PARTS:-1} -e SGLANG_EXL3_MOE_PREFILL_FP16_ACC=${SGLANG_EXL3_MOE_PREFILL_FP16_ACC:-1}
   -e SGLANG_EXL3_NGRAM_TIER=${SGLANG_EXL3_NGRAM_TIER:-nvme}
+  -e SGLANG_EXL3_MM_FAST_CPU=${SGLANG_EXL3_MM_FAST_CPU:-1} -e SGLANG_EXL3_VIT_SDPA=${SGLANG_EXL3_VIT_SDPA:-1} -e SGLANG_EXL3_VIT_MLP_CHUNK=${SGLANG_EXL3_VIT_MLP_CHUNK:-8192}
   -e PYTHONPATH=/opt/trellis-serve/cuda/csrc/build/lib -e SGLANG_EXL3_JIT_DIR=/opt/trellis-serve/cuda/csrc/build/jit
-  $(env | grep -E "^(SGLANG_|EXL3_|PYTORCH_CUDA_ALLOC_CONF=)" | grep -v -E "^(SGLANG_EXL3_MOE_OFFLOAD|EXL3_MOE_CPU_THREADS|SGLANG_EXL3_EXPERT_CACHE_GB|SGLANG_EXL3_EMBED_HOST|SGLANG_EXL3_NGRAM_TIER|SGLANG_EXL3_OFFLOAD_STAGING_PARTS|SGLANG_EXL3_OFFLOAD_FUSED|SGLANG_EXL3_OFFLOAD_COMPACT_PARTS|SGLANG_EXL3_MOE_PREFILL_FP16_ACC)=" | sed "s/^/-e /" | tr "\n" " ")
+  $(env | grep -E "^(SGLANG_|EXL3_|PYTORCH_CUDA_ALLOC_CONF=)" | grep -v -E "^(SGLANG_EXL3_MOE_OFFLOAD|EXL3_MOE_CPU_THREADS|SGLANG_EXL3_EXPERT_CACHE_GB|SGLANG_EXL3_EMBED_HOST|SGLANG_EXL3_NGRAM_TIER|SGLANG_EXL3_OFFLOAD_STAGING_PARTS|SGLANG_EXL3_OFFLOAD_FUSED|SGLANG_EXL3_OFFLOAD_COMPACT_PARTS|SGLANG_EXL3_MOE_PREFILL_FP16_ACC|SGLANG_EXL3_MM_FAST_CPU|SGLANG_EXL3_VIT_SDPA|SGLANG_EXL3_VIT_MLP_CHUNK)=" | sed "s/^/-e /" | tr "\n" " ")
   ${DOCKER_ENV:-}
   -v "$HOME/models:/models:ro" -v "$TS:/opt/trellis-serve" -v "$HOME/freetoken-exl3:/w"
   --entrypoint bash "$IMAGE" -c "$INNER")
