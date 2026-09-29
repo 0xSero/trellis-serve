@@ -41,6 +41,10 @@ def activate() -> None:
             ngram_host.install()
         except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp
             logger.info("sglang-exl3: n-gram host table shim not installed (%s)", e)
+    if os.environ.get("SGLANG_EXL3_VISION", "1") == "1":
+        # EXL3-quantized ViT linears decoded into SGLang's dense tower at load + PLE image-id fix (vision_exl3.py)
+        from .sglang_glue import vision_exl3
+        vision_exl3.install()
     if os.environ.get("SGLANG_EXL3_VIT_SDPA", "0") == "1":
         from .sglang_glue import vit_attn
         vit_attn.install()
