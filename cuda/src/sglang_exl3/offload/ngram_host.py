@@ -244,6 +244,9 @@ def install() -> None:
 
     cls.__init__ = __init__
     cls._exl3_patched = True
+    if tier() == "nvme":
+        from .ngram_nvme import install_prefill_hints
+        install_prefill_hints()
 
     # With config.ple_offload_embedding SGLang wraps the table in Qwen4ExpPinnedHostEmbedding (bf16/fp8 host copy);
     # ours already lives in host memory and implements the same gather/allocate_output/reduce interface: pass through.

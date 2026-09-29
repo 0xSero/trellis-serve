@@ -255,6 +255,7 @@ public:
         {
             int64_t m = std::min(chunk, n - done);
             tmp.resize(m);
+            while (svc_waiting_.load(std::memory_order_acquire)) std::this_thread::yield();   // service first
             std::lock_guard<std::mutex> g(mu_);
             resolve_locked(p + done, m, tmp.data(), false);
             done += m;
@@ -605,8 +606,10 @@ private:
             double t0 = now_us();
             uint32_t n = __atomic_load_n(ctrl_ + C_N, __ATOMIC_ACQUIRE);
             if ((int64_t) n > cap_) { __atomic_store_n(ctrl_ + C_ERR, 3u, __ATOMIC_RELEASE); n = (uint32_t) cap_; }
+            svc_waiting_.store(true, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> g(mu_);
+                svc_waiting_.store(false, std::memory_order_release);
                 resolve_locked(req_, n, resp_, true);
                 if (!log_.empty()) log_.back() = (int64_t) ((now_us() - t0) * 1000);
             }
@@ -621,7 +624,8 @@ private:
     int64_t row_bytes_, nslots_;
     int backend_, threads_, qd_;
     int64_t max_run_, merge_gap_, cap_;
-    int64_t warm_chunk_ = 1024;
+    int64_t warm_chunk_ = 256;
+    std::atomic<bool> svc_waiting_{false};
     bool dry_ = false;
     std::vector<Extent> ext_;
     int64_t num_rows_ = 0;

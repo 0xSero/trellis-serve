@@ -263,3 +263,48 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.store.reset_counters()
         if self.device is not None:
             self.stall.zero_()
+
+
+_HINT_WARNED = [False]
+
+
+def install_prefill_hints() -> None:
+    """Warm the NVMe tier's RAM cache for the *next* prefill chunk while the current one computes.
+
+    Wraps SGLang `Scheduler.get_new_batch_prefill`: after scheduling, if a request is still being chunked
+    (`self.chunked_req`), its next `chunked_prefill_size` prompt tokens (after `len(req.fill_ids)`) are hashed on the
+    CPU and warmed asynchronously. Only works when the scheduler and the model worker share a process (tp_size 1).
+    A wrong or late hint costs nothing but hit rate: lookups always go through the normal graph-safe path.
+    Disable with SGLANG_EXL3_NGRAM_HINT=0."""
+    if os.environ.get("SGLANG_EXL3_NGRAM_HINT", "1") == "0":
+        return
+    from sglang.srt.managers import scheduler as sch
+    cls = sch.Scheduler
+    if getattr(cls, "_exl3_ngram_hint", False):
+        return
+    orig = cls.get_new_batch_prefill
+
+    def get_new_batch_prefill(self, *a, **k):
+        out = orig(self, *a, **k)
+        try:
+            req = getattr(self, "chunked_req", None)
+            if req is not None:
+                from .ngram_host import _TABLES
+                tabs = [t for t in _TABLES.values() if isinstance(t, Exl3NgramNvmeTable)]
+                if tabs:
+                    tab = tabs[0]
+                    ids = list(req.origin_input_ids)
+                    start = len(req.fill_ids)
+                    size = int(getattr(self, "chunked_prefill_size", 0) or 8192)
+                    if 0 < start < len(ids):
+                        eos = getattr(tab, "eos_token_id", None)
+                        hist = ([eos, eos] + ids[:start])[-2:]
+                        tab.hint_tokens(ids[start:start + size], history=hist, eos=eos)
+        except Exception as e:  # never break scheduling for a hint
+            if not _HINT_WARNED[0]:
+                _HINT_WARNED[0] = True
+                logger.warning("n-gram NVMe prefill hint disabled after error: %r", e)
+        return out
+
+    cls.get_new_batch_prefill = get_new_batch_prefill
+    cls._exl3_ngram_hint = True
