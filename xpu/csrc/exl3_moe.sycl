@@ -1238,6 +1238,67 @@ std::vector<at::Tensor> moe_align(at::Tensor topk_ids, at::Tensor topk_w, int64_
     return {rb.ib, rb.fb};
 }
 
+
+// ------------------------------------------------------------------------------------------------
+// Qwen3.8-Flash-Next n-gram table (exl3_ngram_trellis): rows of [fp16 scale word, 160 x K-bit tail-biting mul1
+// trellis] in USM host memory; one work-group (160 items) per looked-up row reads the packed row zero-copy and decodes
+// it (+ per-head fp16 bias). Same math as exllamav3 ngram_dequant_kernel (and the 3090 lane's ngram_gather_dequant).
+// table: chunk pointer table (device int64 [n_chunks]; sycl::malloc_host is limited to < ~30 GiB per allocation on
+// this driver, 16 GiB works), rows_per_chunk rows each (last chunk may be shorter).
+void ngram_gather_dequant(at::Tensor ids, at::Tensor chunk_ptrs, int64_t rows_per_chunk, int64_t num_rows,
+                          int64_t words, int64_t K, at::Tensor head_bias, at::Tensor out) {
+    TORCH_CHECK(ids.scalar_type() == at::kLong && ids.is_contiguous());
+    TORCH_CHECK(head_bias.scalar_type() == at::kHalf && out.is_contiguous());
+    TORCH_CHECK(out.scalar_type() == at::kBFloat16 || out.scalar_type() == at::kHalf);
+    int N = ids.numel();
+    if (N == 0) return;
+    auto& q = queue_of(ids);
+    const int64_t* idp = ids.data_ptr<int64_t>();
+    const int64_t* cps = chunk_ptrs.data_ptr<int64_t>();
+    int64_t RPC = rows_per_chunk;
+    const sycl::half* bias = reinterpret_cast<const sycl::half*>(head_bias.data_ptr());
+    int H = head_bias.size(0), W = (int)words, Kb = (int)K;
+    int64_t NR = num_rows;
+    bool is_bf = out.scalar_type() == at::kBFloat16;
+    void* op = out.data_ptr();
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint16_t, 1> sw(sycl::range<1>(64), h);
+        h.parallel_for(sycl::nd_range<1>((size_t)N * 160, 160), [=](sycl::nd_item<1> it) {
+            int r = it.get_group(0), i = it.get_local_id(0);
+            int64_t row = idp[r];
+            bool valid = row >= 0 && row < NR;
+            if (i < W) {
+                uint16_t v = 0;
+                if (valid) {
+                    const uint16_t* tab = reinterpret_cast<const uint16_t*>(cps[row / RPC]);
+                    v = tab[(row % RPC) * W + i];
+                }
+                sw[i] = v;
+            }
+            sycl::group_barrier(it.get_group());
+            uint16_t sc = sw[0];
+            float scale = (float)sycl::bit_cast<sycl::half>(sc);
+            uint32_t state = 0;
+            for (int m = 0; m < 16; ++m) {
+                int pos = i - m / Kb;
+                if (pos < 0) pos += 160;
+                int sb = pos * Kb + m % Kb;
+                uint32_t bit = (sw[1 + (sb >> 4)] >> (sb & 15)) & 1u;
+                state |= bit << m;
+            }
+            uint32_t prod = state * 0x83DCD12Du;
+            float hsum = 1024.0f + (float)((prod & 0xff) + ((prod >> 8) & 0xff) + ((prod >> 16) & 0xff) + ((prod >> 24) & 0xff));
+            float k_inv = (float)sycl::bit_cast<sycl::half>((uint16_t)0x1eee);
+            float k_bias = (float)sycl::bit_cast<sycl::half>((uint16_t)0xc931);
+            float cb = (float)(sycl::half)(hsum * k_inv + k_bias);
+            float b = (float)bias[(size_t)(r % H) * 160 + i];
+            float v = (float)(sycl::half)(cb * scale + b);
+            if (is_bf) reinterpret_cast<sycl::ext::oneapi::bfloat16*>(op)[(size_t)r * 160 + i] = sycl::ext::oneapi::bfloat16(v);
+            else reinterpret_cast<sycl::half*>(op)[(size_t)r * 160 + i] = (sycl::half)v;
+        });
+    });
+}
+
 // ------------------------------------------------------------------------------------------------
 // Host USM: sycl::malloc_host in torch's XPU context, returned as a CPU uint8 tensor (device-readable, zero-copy).
 at::Tensor host_alloc(int64_t nbytes) {
@@ -1290,6 +1351,8 @@ TORCH_LIBRARY(exl3xpu_moe, m) {
     m.def("usm_kind(int ptr) -> int", &moe::usm_kind);
     m.def("memcpy_async(int dst, int src, int nbytes) -> ()", &moe::memcpy_async);
     m.def("blob_bytes(int H, int I, int K) -> int", &moe::blob_bytes);
+    m.def("ngram_gather_dequant(Tensor ids, Tensor chunk_ptrs, int rows_per_chunk, int num_rows, int words, int K, Tensor head_bias, Tensor(a!) out) -> ()");
+    m.impl("ngram_gather_dequant", torch::kXPU, &moe::ngram_gather_dequant);
     m.def("moe_set_splits(int gu_p, int dn_p) -> ()", &moe::moe_set_splits);
     m.def("moe_set_mr(int mr) -> ()", &moe::moe_set_mr);
     m.def("moe_set_debug(int v) -> ()", &moe::moe_set_debug);

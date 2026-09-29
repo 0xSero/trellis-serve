@@ -67,6 +67,8 @@ def norm_key(k: str) -> str:
     'model.language_model.layers.3.mlp.gate_proj' / 'model.layers.3.mlp.gate_proj' -> 'layers.3.mlp.gate_proj';
     'mtp.layers.0.mlp.gate_proj' -> 'mtp.layers.0.mlp.gate_proj'; '...mtp.fc' -> 'mtp.fc'; '...lm_head' -> 'lm_head'."""
     parts = k.split(".")
+    if "visual" in parts:          # vision tower: 'visual.blocks.N...' (the layers.N rule below would drop the block id)
+        return "visual." + ".".join(parts[parts.index("visual") + 1:])
     if "mtp" in parts:
         return "mtp." + ".".join(parts[parts.index("mtp") + 1:])
     m = re.search(r"(layers\.\d+\..*)$", k)
@@ -231,8 +233,10 @@ def _build_classes():
             except ImportError:  # pragma: no cover
                 pass
             parts = prefix.split(".")
-            if "visual" in parts or "vision_tower" in parts:
-                return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None
+            if ("visual" in parts or "vision_tower" in parts) and isinstance(layer, LinearBase):
+                infos = [self.lookup(p) for p in self._sources(prefix)]
+                # Flash-Next quantizes the ViT (vision_bits 5): EXL3 there; bf16 checkpoints' ViTs stay unquantized
+                return Exl3XpuLinearMethod(prefix, infos) if infos and all(infos) else UnquantizedLinearMethod()
             draft = prefix.startswith("mtp") or ".mtp." in prefix or getattr(layer, "_exl3_draft", False)
             if isinstance(layer, ParallelLMHead):
                 info = self.lookup(prefix, draft)
@@ -1144,6 +1148,13 @@ def activate() -> None:
             add_quantization_method_choices(["exl3"])
     except Exception as e:  # pragma: no cover
         logger.warning("exl3xpu: could not add 'exl3' to --quantization choices (%s)", e)
+    if os.environ.get("EXL3_NGRAM_HOST", "1") == "1":
+        # Qwen3.8-Flash-Next EXL3 n-gram table: USM host memory + zero-copy gather/decode (ngram_host.py)
+        try:
+            from . import ngram_host
+            ngram_host.install()
+        except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp
+            logger.info("exl3xpu: n-gram host table shim not installed (%s)", e)
     _patch_mtp()
     _patch_xpu_spec_sampling()
     _patch_xpu_gdn_verify()
