@@ -22,7 +22,8 @@ Env (read at construction):
                                 page cache keeps up to the 32.6 GB file as reclaimable memory, N020/N021/N042) |
                                 pread (O_DIRECT, fixed RAM use, ~285k rows/s at >= 32 threads) | mmap (MADV_RANDOM,
                                 ~= buffered) | aio (O_DIRECT io_submit, ~180k rows/s)
-  SGLANG_EXL3_NGRAM_POLICY      clock (default) | gclock (2-bit frequency CLOCK) | cold (new rows inserted unreferenced)
+  SGLANG_EXL3_NGRAM_POLICY      cold (default: CLOCK, new rows inserted unreferenced; N024 +0.5-0.8 pt hit rate at 4-12 GB)
+                                | clock | gclock (2-bit frequency CLOCK, == cold)
   SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  read threads (64)
   SGLANG_EXL3_NGRAM_PC_DROP     buffered/mmap: evict read spans from the page cache (default 0; loses the speed-up)
   SGLANG_EXL3_NGRAM_HINT_ARRIVAL warm a request's first chunk when it is queued (default 1; neutral on an idle server)
@@ -142,7 +143,7 @@ class Exl3NgramNvmeTable(torch.nn.Module):
                                        _env("SGLANG_EXL3_NGRAM_MAX_RUN", 65536, int),
                                        _env("SGLANG_EXL3_NGRAM_MERGE_GAP", 0, int), self.cap)
         self.nslots = nslots
-        pol = _env("SGLANG_EXL3_NGRAM_POLICY", "clock")
+        pol = _env("SGLANG_EXL3_NGRAM_POLICY", "cold")
         self.store.set_policy({"clock": 0, "gclock": 1, "cold": 2}[pol])
         self.store.set_pc_drop(_env("SGLANG_EXL3_NGRAM_PC_DROP", "0") == "1")
         self.file_hash = {k: aux[k].long() for k in ("head_offsets", "head_vocab_sizes", "layer_multipliers")}
