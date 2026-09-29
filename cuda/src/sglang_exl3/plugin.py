@@ -111,7 +111,7 @@ def _patch_host_embedding() -> None:
     except Exception:  # pragma: no cover
         return
     cls4 = q4.Qwen4ExpModel
-    if getattr(cls4, "_exl3_host_embed", False):
+    if "_exl3_host_embed" in cls4.__dict__:        # (the flag set on Qwen3_5ForCausalLM above is inherited)
         return
     orig4 = cls4._build_embed_tokens
 
