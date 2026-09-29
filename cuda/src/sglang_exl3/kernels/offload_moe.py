@@ -129,7 +129,8 @@ def fill_admit_(wb: torch.Tensor, dst_bases: torch.Tensor, offsets: torch.Tensor
 
 
 def run(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, block: int, table: torch.Tensor,
-        lay: RecordLayout, codebook: int, out: torch.Tensor | None = None, admit: torch.Tensor | None = None) -> torch.Tensor:
+        lay: RecordLayout, codebook: int, out: torch.Tensor | None = None, admit: torch.Tensor | None = None,
+        scratch: int = 0) -> torch.Tensor:
     """x fp16 | bf16 [T, H]; topk_weights fp32 [T, top_k]; topk_ids int32 | int64 [T, top_k] (logical ids);
     sorted_ids / expert_ids / num_post_padded = moe_align_block_size(topk_ids, block, E); table int64 [E, 6].
     admit (optional, int64 [E, 6], see fill_admit_): fused admission - every routed expert with a nonzero admit row is
@@ -151,11 +152,12 @@ def run(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, bloc
     gu = torch.empty((slots, 2 * inter), **f16)
     cb = codebook
     mod.moe_gemm_ptr(xh, gu, table, F_W13, F_SVH13, lay.bits, sorted_ids, expert_ids, num_post_padded, block, inter, cb,
-                     wb=admit)
+                     scratch=scratch, wb=admit)
     act, xd = torch.empty((slots, inter), **f16), torch.empty((slots, inter), **f16)
     mod.moe_glu_had_in_ptr(gu, table, F_SUH2, topk_ids, act, xd)
     yd = xh[:slots]
-    mod.moe_gemm_ptr(xd, yd, table, F_W2, F_SVH2, lay.bits, sorted_ids, expert_ids, num_post_padded, block, 0, cb, wb=admit)
+    mod.moe_gemm_ptr(xd, yd, table, F_W2, F_SVH2, lay.bits, sorted_ids, expert_ids, num_post_padded, block, 0, cb,
+                     scratch=scratch, wb=admit)
     mod.moe_combine(yd, topk_weights, topk_ids, table.shape[0], y)
     return y
 

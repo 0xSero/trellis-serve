@@ -270,7 +270,7 @@ def run_mixed(x, topk_weights, topk_ids, routings, pack: MixedPack, out: torch.T
 
 
 def run_tensors(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, block: int, w13, w2, suh13, svh13,
-                suh2, svh2, codebook: int, out: torch.Tensor | None = None) -> torch.Tensor:
+                suh2, svh2, codebook: int, out: torch.Tensor | None = None, scratch: int = 0) -> torch.Tensor:
     """x fp16 | bf16 [T, H]; topk_weights float32 [T, top_k]; topk_ids int32 | int64 [T, top_k];
     sorted_ids / expert_ids / num_post_padded from moe_align_block_size(topk_ids, block, E). -> y [T, H] (x's dtype)."""
     mod = _load()
@@ -285,19 +285,21 @@ def run_tensors(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padd
     mod.moe_had_in(x, suh13, topk_ids, xh)
     gu = torch.empty((slots, 2 * inter), **f16)
     cb = effective_codebook(codebook, block)
-    mod.moe_gemm(xh, w13, gu, svh13, sorted_ids, expert_ids, num_post_padded, block, inter, cb)
+    mod.moe_gemm(xh, w13, gu, svh13, sorted_ids, expert_ids, num_post_padded, block, inter, cb, -1, -1, scratch)
     act, xd = torch.empty((slots, inter), **f16), torch.empty((slots, inter), **f16)
     mod.moe_glu_had_in(gu, suh2, topk_ids, act, xd)
     yd = xh[:slots]                                 # reuse: the gate slab is dead after the first GEMM
-    mod.moe_gemm(xd, w2, yd, svh2, sorted_ids, expert_ids, num_post_padded, block, 0, cb)
+    mod.moe_gemm(xd, w2, yd, svh2, sorted_ids, expert_ids, num_post_padded, block, 0, cb, -1, -1, scratch)
     mod.moe_combine(yd, topk_weights, topk_ids, w13.shape[0], y)
     return y
 
 
 def run(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, block: int, pack: ExpertPack,
-        out: torch.Tensor | None = None) -> torch.Tensor:
+        out: torch.Tensor | None = None, scratch: int = 0) -> torch.Tensor:
+    """scratch: 0 / 1 = which per-device lock + fp32-reduce scratch set the GEMMs use; two launches of this module that
+    may run CONCURRENTLY (different streams) must use different sets."""
     return run_tensors(x, topk_weights, topk_ids, sorted_ids, expert_ids, num_post_padded, block, *pack.tensors(),
-                       pack.codebook, out)
+                       pack.codebook, out, scratch)
 
 
 # ---------------------------------------------------------------------------------------------------------------

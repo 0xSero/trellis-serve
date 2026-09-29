@@ -60,42 +60,58 @@ __global__ __launch_bounds__(1024) void trellis_cache_step_kernel(
     }
   }
   __syncthreads();
-  if (t != 0) return;
-  stats[2 * layer + 0] += n_hit;
-  stats[2 * layer + 1] += n_miss;
-  if (!do_admit || S == 0) return;
+  if (t == 0) {
+    stats[2 * layer + 0] += n_hit;
+    stats[2 * layer + 1] += n_miss;
+  }
+  if (!do_admit || S == 0 || t >= 32) return;
+  // CLOCK victim search by warp 0, 32 slots per step with the exact sequential semantics: lane j looks at slot
+  // (h + j) % S; the first lane whose slot is free or (not used this step and ref == 0) is the victim; every slot the
+  // hand passes before it (used this step: skipped; ref == 1: cleared) is treated as the sequential loop would. A
+  // single-thread walk cost ~0.5 us per slot (dependent global loads) and dominated the layer at high miss rates.
+  const int lane = t;
   int h = hand[0];
   for (int m = 0; m < n_miss; m++) {
     const int e = miss_list[m];
     int victim = -1;
-    for (int tries = 0; tries < 2 * S + 1; tries++) {
-      const int v = h;
-      h = (h + 1 == S) ? 0 : h + 1;
-      if (owner[v] < 0) { victim = v; break; }
-      if (stamp[v] == c) continue;  // used in this step: never evicted
-      if (ref[v]) { ref[v] = 0; continue; }
-      victim = v;
-      break;
+    for (int scanned = 0; scanned < 2 * S + 32 && victim < 0; scanned += 32) {
+      const int v = (h + lane) % S;
+      const int o = owner[v];
+      const bool pinned = o >= 0 && stamp[v] == c;
+      const bool cand = o < 0 || (!pinned && ref[v] == 0);
+      const unsigned mask = __ballot_sync(0xffffffffu, cand);
+      const int first = mask ? __ffs(mask) - 1 : 32;
+      if (lane < first && o >= 0 && !pinned) ref[v] = 0;   // passed with a second chance
+      __syncwarp();
+      if (first < 32) {
+        victim = (h + first) % S;
+        h = (h + first + 1) % S;
+      } else {
+        h = (h + 32) % S;
+      }
     }
     if (victim < 0) break;  // every slot is in use this step: remaining misses stay zero-copy only
-    const int o = owner[victim];
-    if (o >= 0) {  // evict: the old owner goes back to its host bank row
-      slot_of[o] = -1;
-      const int ol = o / E, oe = o % E;
-      int64_t* row = tables + (int64_t)o * F;
-      const int64_t hb = host_bases[ol] + (int64_t)oe * rec;
-      for (int f = 0; f < F; f++) row[f] = hb + off_sh[f];
+    if (lane == 0) {
+      const int o = owner[victim];
+      if (o >= 0) {  // evict: the old owner goes back to its host bank row
+        slot_of[o] = -1;
+        const int ol = o / E, oe = o % E;
+        int64_t* row = tables + (int64_t)o * F;
+        const int64_t hb = host_bases[ol] + (int64_t)oe * rec;
+        for (int f = 0; f < F; f++) row[f] = hb + off_sh[f];
+      }
+      const int g = layer * E + e;
+      owner[victim] = g;
+      slot_of[g] = victim;
+      stamp[victim] = c;
+      ref[victim] = 1;
+      int64_t* arow = admit + (int64_t)e * F;
+      const int64_t db = arena_base + (int64_t)victim * rec;
+      for (int f = 0; f < F; f++) arow[f] = db + off_sh[f];
     }
-    const int g = layer * E + e;
-    owner[victim] = g;
-    slot_of[g] = victim;
-    stamp[victim] = c;
-    ref[victim] = 1;
-    int64_t* arow = admit + (int64_t)e * F;
-    const int64_t db = arena_base + (int64_t)victim * rec;
-    for (int f = 0; f < F; f++) arow[f] = db + off_sh[f];
+    __syncwarp();
   }
-  hand[0] = h;
+  if (lane == 0) hand[0] = h;
 }
 
 __global__ __launch_bounds__(1024) void trellis_cache_commit_kernel(const int* __restrict__ ids, int nids, int E, int F,

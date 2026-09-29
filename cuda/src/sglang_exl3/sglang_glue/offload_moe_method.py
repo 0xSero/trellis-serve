@@ -7,7 +7,8 @@ but their loader DISCARDS the tensors: the experts are read once, straight from 
 the first layer finishes loading (all layers in one pass). To also skip SGLang's own read of those tensors, filter the
 weight iterator with `is_offloaded_expert_key(name)`.
 
-Knobs (env): SGLANG_EXL3_OFFLOAD_SLOTS (cache slots; else SGLANG_EXL3_OFFLOAD_CACHE_GB, default 8 GB),
+Knobs (env): SGLANG_EXL3_EXPERT_CACHE_GB (slot-pool byte budget, GB) or SGLANG_EXL3_OFFLOAD_SLOTS (slots) or
+SGLANG_EXL3_OFFLOAD_CACHE_GB (default 8 GB),
 SGLANG_EXL3_OFFLOAD_PREFILL_MIN (tokens from which the staged prefill path is used, default 128),
 SGLANG_EXL3_OFFLOAD_STATS_EVERY (log per-layer hit rates every N decode forwards of layer 0; 0 = off).
 """
@@ -31,13 +32,25 @@ _LAYER_RE = re.compile(r"layers\.(\d+)\.")
 _KEY_RE = re.compile(r"^(.*layers\.)(\d+)\.mlp\.experts\.\d+\.(gate|up|down)_proj\.")
 
 
+def offload_enabled() -> bool:
+    return os.environ.get("SGLANG_EXL3_MOE_OFFLOAD", "0") in ("1", "gpu_cache")
+
+
+def offload_stats(reset: bool = False) -> dict:
+    """Per-layer counters of every live runtime: decode hits / misses (device counters), prefill copied / resident
+    experts, slots, resident slots. Host sync: call outside CUDA-graph capture (e.g. per request for logging)."""
+    return {f"{k[0]}@cuda:{k[1]}": rt.stats(reset) for k, rt in _RUNTIMES.items()}
+
+
 def is_offloaded_expert_key(name: str) -> bool:
     """True for checkpoint / SGLang weight names of main-model routed experts (their data is read by the store)."""
-    return os.environ.get("SGLANG_EXL3_MOE_OFFLOAD", "0") == "1" and ".mlp.experts." in name \
+    return offload_enabled() and ".mlp.experts." in name \
         and not name.startswith("mtp.") and "shared_expert" not in name
 
 
 def _slots_from_env(record_bytes: int) -> int:
+    if os.environ.get("SGLANG_EXL3_EXPERT_CACHE_GB"):             # integration contract: byte budget
+        return int(float(os.environ["SGLANG_EXL3_EXPERT_CACHE_GB"]) * 1e9 // record_bytes)
     if os.environ.get("SGLANG_EXL3_OFFLOAD_SLOTS"):
         return int(os.environ["SGLANG_EXL3_OFFLOAD_SLOTS"])
     gb = float(os.environ.get("SGLANG_EXL3_OFFLOAD_CACHE_GB", "8"))
@@ -110,7 +123,13 @@ class Exl3OffloadMoEMethod(Exl3MoEMethod):
 
     def _experts(self, layer, x, topk_ids, topk_weights):
         rt = layer.exl3_offload
-        y = rt.forward(layer.exl3_store_index, x, topk_ids, topk_weights)
+        try:
+            from sglang.srt.model_executor.runner import get_is_capture_mode
+            capture = bool(get_is_capture_mode())
+        except Exception:  # pragma: no cover
+            capture = False
+        # capture mode (or stream capture): decode path only - no host sync, graph-safe
+        y = rt.forward(layer.exl3_store_index, x, topk_ids, topk_weights, force="decode" if capture else None)
         if self._stats_every and layer.exl3_store_index == 0 and x.shape[0] < rt.prefill_min_tokens \
                 and not torch.cuda.is_current_stream_capturing():
             self._calls += 1

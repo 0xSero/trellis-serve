@@ -61,7 +61,8 @@ class OffloadRuntime:
         if T == 0:
             return torch.empty_like(x)
         ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
-        ids = ids.contiguous()
+        # SGLang masks padded rows of a graph batch to -1 (undefined in the align op): map them to the drop sentinel E
+        ids = torch.where(ids < 0, torch.full_like(ids, self.E), ids).contiguous()
         w = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
         w = w.contiguous()
         x = x.contiguous()

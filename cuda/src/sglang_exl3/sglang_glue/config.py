@@ -133,7 +133,7 @@ class Exl3Config(QuantizationConfig):
             if not experts:
                 return None
             # SGLANG_EXL3_MOE_OFFLOAD=1: main-model routed experts in pinned host memory + global GPU expert cache
-            if os.environ.get("SGLANG_EXL3_MOE_OFFLOAD", "0") == "1" and not prefix.startswith("mtp"):
+            if os.environ.get("SGLANG_EXL3_MOE_OFFLOAD", "0") in ("1", "gpu_cache") and not prefix.startswith("mtp"):
                 from .offload_moe_method import Exl3OffloadMoEMethod
                 return Exl3OffloadMoEMethod(self, prefix, experts)
             return Exl3MoEMethod(self, prefix, experts)
