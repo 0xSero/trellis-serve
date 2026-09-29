@@ -184,28 +184,24 @@ def extract_qkv(k: QKVView, v: QKVView, req_to_token, req_indices, indices, seq_
 
 
 def _patch_cell_size(bits):
-    """Bytes per token for the KV pool sizing: fp8 K+V -> packed words + scales."""
+    """Bytes per token for the KV pool sizing (DefaultPoolConfigurator, num_layers = full-attention layers):
+    fp8 K+V -> packed words + fp16 group scales."""
     from sglang.srt.model_executor import pool_configurator as pc
-    cls = None
-    for name in dir(pc):
-        obj = getattr(pc, name)
-        if isinstance(obj, type) and "_compute_cell_size" in obj.__dict__:
-            cls = obj
-            break
-    if cls is None or getattr(cls, "_exl3_qkv", False):
+    cls = pc.DefaultPoolConfigurator
+    if getattr(cls, "_exl3_qkv", False):
         return
     orig = cls._compute_cell_size
 
     def _compute_cell_size(self, kvc, num_layers):
         cell = orig(self, kvc, num_layers)
         try:
+            from sglang.srt.runtime_context import get_parallel
             mc = kvc.model_config
-            full = len(getattr(mc, "full_attention_layer_ids", []) or [])
-            heads = mc.get_num_kv_heads(1)
-            d = mc.head_dim
-            fp8 = full * heads * d * 2 * torch._utils._element_size(kvc.kv_cache_dtype)
-            q = full * heads * 2 * (d // 32 * bits * 4 + d // 32 * 2)
-            if full and fp8 < cell:
+            n = mc.get_num_kv_heads(get_parallel().attn_tp_size, get_parallel().attn_dcp_size)
+            dk, dv = mc.head_dim, mc.v_head_dim
+            fp8 = n * (dk + dv) * num_layers * torch._utils._element_size(kvc.kv_cache_dtype)
+            q = n * num_layers * ((dk + dv) // 32 * (bits * 4 + 2))
+            if 0 < fp8 <= cell:
                 logger.info("sglang-exl3: KV cell size %d -> %d B/token (%d-bit QSA KV)", cell, cell - fp8 + q, bits)
                 return cell - fp8 + q
         except Exception as e:  # pragma: no cover
