@@ -74,4 +74,4 @@ print(json.dumps(out[-1]), flush=True)
 for pred in ("cooc", "prev"):
     for kpf in (1, 2, 3, 5):
         out.append(run(pred, kpf)); print(json.dumps(out[-1]), flush=True)
-json.dump(out, open(f"/Users/sero/freetoken-exl3/runs/2026-09-29-K03-sim/prefetch_sim_{B}.json", "w"), indent=1)
+json.dump(out, open(os.path.join(os.environ.get("OUT_DIR", "."), f"prefetch_sim_{B}.json"), "w"), indent=1)
