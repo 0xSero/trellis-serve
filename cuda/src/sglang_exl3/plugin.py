@@ -29,6 +29,9 @@ def activate() -> None:
         _patch_host_embedding()
     from .sglang_glue import qsa_sm86
     qsa_sm86.install()                       # QSA decode attention without FA2/FA4 on sm_86
+    _patch_decode_token_ids_logprobs()
+    from .sglang_glue import qsa_fp8e4m3
+    qsa_fp8e4m3.install()                    # e4m3 KV pool readable by the QSA kernels on sm_86
     if os.environ.get("SGLANG_EXL3_NGRAM_HOST", "1") == "1":
         # Qwen3.8-Flash-Next EXL3 n-gram table: pinned host memory + zero-copy gather/decode (offload/ngram_host.py);
         # a no-op for checkpoints without ngram_embedding.safetensors
@@ -49,6 +52,27 @@ def activate() -> None:
         vit_attn.install_mlp_chunk(int(os.environ["SGLANG_EXL3_VIT_MLP_CHUNK"]))
         logger.info("sglang-exl3: vision MLP row-chunked at %s rows", os.environ["SGLANG_EXL3_VIT_MLP_CHUNK"])
     logger.info("sglang-exl3: registered quantization method 'exl3'")
+
+
+def _patch_decode_token_ids_logprobs() -> None:
+    """SGLang 0.5.20 bug: a decode step of a request with `token_ids_logprob` crashes the scheduler
+    (`_normalize_decode_outputs` calls .tolist() on next_token_token_ids_logprobs_val entries that are already lists).
+    Seen with the reference-panel scorer; tolerate both forms."""
+    try:
+        from sglang.srt.managers.scheduler_components.batch_result_processor import SchedulerBatchResultProcessor as P
+    except Exception:  # pragma: no cover
+        return
+    if getattr(P, "_exl3_tolist_patch", False):
+        return
+    orig = P._normalize_decode_outputs
+
+    def _normalize_decode_outputs(self, *, batch, result, logits_output, next_token_ids):
+        vals = getattr(logits_output, "next_token_token_ids_logprobs_val", None)
+        if vals and batch.return_logprob:
+            logits_output.next_token_token_ids_logprobs_val = [
+                v if (v is None or torch.is_tensor(v)) else torch.tensor(v, dtype=torch.float32) for v in vals]
+        return orig(self, batch=batch, result=result, logits_output=logits_output, next_token_ids=next_token_ids)
+    P._normalize_decode_outputs, P._exl3_tolist_patch = _normalize_decode_outputs, True
 
 
 HOST_EMBEDS: list = []
