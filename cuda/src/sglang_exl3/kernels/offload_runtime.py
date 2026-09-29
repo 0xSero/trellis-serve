@@ -29,7 +29,7 @@ def _align(ids, block, num_experts):
 
 class OffloadRuntime:
     def __init__(self, store: HostExpertStore, slots: int, codebook: int = 2, top_k: int = 10,
-                 prefill_min_tokens: int = 256, staging: bool = True, device=None):
+                 prefill_min_tokens: int = 192, staging: bool = True, device=None):
         self.store, self.lay, self.cb, self.top_k = store, store.lay, codebook, top_k
         self.L, self.E = store.L, store.E
         dev = torch.device(device or "cuda")
