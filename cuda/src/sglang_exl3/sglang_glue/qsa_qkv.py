@@ -159,15 +159,18 @@ def _compact_qkv(kp, ks, vp, vs, req_to_token, req_indices, indices, seq_lens, c
 def extract_qkv(k: QKVView, v: QKVView, req_to_token, req_indices, indices, seq_lens, cu_k, out_k, out_v, batch, topk,
                 zero_fill_cols: int = 0):
     """Packed counterpart of SGLang's qwen_sparse_kv_extraction_compact_triton (same compact/strided layout)."""
-    cap, heads, D = out_k.shape[0], k.packed.shape[1], k.head_dim
+    heads, D = k.packed.shape[1], k.head_dim
     W, G = k.packed.shape[-1], k.scales.shape[-1]
     dev = out_k.device
-    okp = torch.zeros((cap, heads, W), dtype=torch.int32, device=dev)
-    oks = torch.zeros((cap, heads, G), dtype=torch.float16, device=dev)
-    ovp = torch.zeros_like(okp)
-    ovs = torch.zeros_like(oks)
     zero_fill = zero_fill_cols > 0
     num_cols = zero_fill_cols if zero_fill else topk
+    # only the rows this batch can occupy (compact layout: < batch * topk; strided: batch * zero_fill_cols); rows past
+    # each sequence's valid count are never read by the attention kernel (masked), so no zero-init is needed
+    rows = min(out_k.shape[0], batch * num_cols)
+    okp = torch.empty((rows, heads, W), dtype=torch.int32, device=dev)
+    oks = torch.empty((rows, heads, G), dtype=torch.float16, device=dev)
+    ovp = torch.empty_like(okp)
+    ovs = torch.empty_like(oks)
     block_topk = 16
     _compact_qkv[(batch, heads, triton.cdiv(num_cols, block_topk))](
         k.packed, k.scales, v.packed, v.scales, req_to_token, req_indices, indices, seq_lens, cu_k,
@@ -175,12 +178,12 @@ def extract_qkv(k: QKVView, v: QKVView, req_to_token, req_indices, indices, seq_
         BLOCK_TOPK=block_topk, BW=triton.next_power_of_2(W), BG=triton.next_power_of_2(G), ZERO_FILL=zero_fill,
         num_warps=4)
     ext = _ext()
-    k16 = torch.empty((cap, heads, D), dtype=torch.float16, device=dev)
-    v16 = torch.empty((cap, heads, D), dtype=torch.float16, device=dev)
+    k16 = torch.empty((rows, heads, D), dtype=torch.float16, device=dev)
+    v16 = torch.empty((rows, heads, D), dtype=torch.float16, device=dev)
     ext.dequant_cache_cont(okp, oks, k16, 0.0)
     ext.dequant_cache_cont(ovp, ovs, v16, 0.0)
-    out_k.copy_(k16)
-    out_v.copy_(v16)
+    out_k[:rows].copy_(k16)
+    out_v[:rows].copy_(v16)
 
 
 def _patch_cell_size(bits):
