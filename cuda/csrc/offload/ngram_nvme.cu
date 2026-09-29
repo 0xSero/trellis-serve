@@ -173,6 +173,10 @@ public:
         slot_row_ = (int32_t*) host_alloc((size_t) nslots_ * 4, true);
         ref_ = (uint8_t*) host_alloc((size_t) nslots_, true);
         epoch_ = (uint32_t*) host_alloc((size_t) nslots_ * 4, true);
+        // last service request that handed the slot to the GPU: protected until the next service request (a warm
+        // hint re-tagging epoch_ must not unprotect a slot the GPU may still be reading; N036 panel KL 0.00107)
+        svcmark_ = (uint32_t*) host_alloc((size_t) nslots_ * 4, true);
+        std::fill(svcmark_, svcmark_ + nslots_, 0xffffffffu);
         std::fill(slot_row_, slot_row_ + nslots_, -1);
         // slab: page-locked + mapped (registered by the caller from Python), 64 B tail pad for the kernel's loads
         slab_bytes_ = ((size_t) nslots_ * row_bytes_ + 4095 + 64) & ~(size_t) 4095;
@@ -221,6 +225,7 @@ public:
         un(slot_row_, (size_t) nslots_ * 4); slot_row_ = nullptr;
         un(ref_, (size_t) nslots_); ref_ = nullptr;
         un(epoch_, (size_t) nslots_ * 4); epoch_ = nullptr;
+        un(svcmark_, (size_t) nslots_ * 4); svcmark_ = nullptr;
         un(slab_, slab_bytes_); slab_ = nullptr;
         un(req_, io_bytes_); req_ = nullptr;
         un(resp_, io_bytes_); resp_ = nullptr;
@@ -390,7 +395,7 @@ private:
             int64_t s = hand_;
             hand_ = hand_ + 1 == nslots_ ? 0 : hand_ + 1;
             if (slot_row_[s] < 0) { st_resident_++; return s; }
-            if (epoch_[s] == cur_epoch_ || epoch_[s] == svc_epoch_) { if (++spins > 3 * nslots_) throw std::runtime_error("ngram_nvme: all slots pinned"); continue; }
+            if (epoch_[s] == cur_epoch_ || svcmark_[s] == svc_epoch_) { if (++spins > 3 * nslots_) throw std::runtime_error("ngram_nvme: all slots pinned"); continue; }
             if (ref_[s]) { ref_[s] = policy_ == GCLOCK ? ref_[s] - 1 : 0; continue; }
             map_[slot_row_[s]] = 0;
             return s;
@@ -412,6 +417,7 @@ private:
             if (s1)
             {
                 int64_t s = s1 - 1;
+                if (service) svcmark_[s] = cur_epoch_;
                 if (epoch_[s] != cur_epoch_)   // else: dup in this request
                 {
                     uniq++; hits++; epoch_[s] = cur_epoch_;
@@ -426,6 +432,7 @@ private:
                 slot_row_[s] = (int32_t) r;
                 ref_[s] = policy_ == CLOCK_COLD ? 0 : 1;
                 epoch_[s] = cur_epoch_;
+                if (service) svcmark_[s] = cur_epoch_;
                 slots[i] = s;
                 misses_.push_back({file_offset(r), s});
                 uniq++;
@@ -695,6 +702,7 @@ private:
     int32_t* slot_row_ = nullptr;
     uint8_t* ref_ = nullptr;
     uint32_t* epoch_ = nullptr;
+    uint32_t* svcmark_ = nullptr;
     uint32_t cur_epoch_ = 0, svc_epoch_ = 0;
     int64_t hand_ = 0;
     uint8_t* slab_ = nullptr;

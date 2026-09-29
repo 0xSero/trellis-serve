@@ -351,6 +351,28 @@ def main():
                 print(json.dumps(o), flush=True)
             tab.release()
         res.update(io=out)
+    elif a.mode == "race":
+        # slots handed to the GPU by a service request must stay valid until the next service request, even when hints
+        # (warm) re-touch those rows and then force evictions (bug before the svcmark fix)
+        rows = file_rows(a.model)
+        tab = make_table(a.model, 0.06, a.io, 16384)
+        slots = torch.empty(tab.cap, dtype=torch.long)
+        g = torch.Generator().manual_seed(5)
+        bad_total = 0
+        for it in range(20):
+            x = torch.randint(0, tab.num_rows, (4096,), generator=g)
+            tab.store.resolve(x, slots)                 # service request: slots now owned by the "GPU"
+            keep = slots[:4096].clone()
+            tab.store.warm(x)                           # hint touches the same rows
+            for _ in range(3):                          # hints for other rows force a full CLOCK sweep
+                tab.store.warm(torch.randint(0, tab.num_rows, (tab.nslots // 2,), generator=g))
+            got = torch.empty(4096 * tab.row_bytes, dtype=torch.uint8)
+            tab.store.read_slots(keep, got)
+            bad = int((got.numpy().reshape(4096, tab.row_bytes) != rows[x.numpy()]).any(axis=1).sum())
+            bad_total += bad
+        res.update(race_iters=20, race_rows=20 * 4096, race_bad_rows=bad_total)
+        print(res, flush=True)
+        tab.release()
     elif a.mode == "qd":
         # cold random reads through the store: n ids per resolve, fresh rows each time
         out = []

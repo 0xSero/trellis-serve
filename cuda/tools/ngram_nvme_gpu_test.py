@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--layer0-us", default="0,250,500")
     ap.add_argument("--decode-steps", type=int, default=2000)
     ap.add_argument("--no-host", action="store_true", help="skip loading the 32.6 GB pinned reference table")
+    ap.add_argument("--hint-stress", action="store_true",
+                    help="tiny cache + a thread warming random rows during graph replays (hint/service eviction race)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dev = torch.device("cuda", 0)
@@ -53,6 +55,45 @@ def main():
         t0 = time.time()
         host = Exl3NgramHostTable(a.model)
         res["host_init_s"] = time.time() - t0
+
+    if a.hint_stress:
+        import threading
+        stop = threading.Event()
+        warmed = [0]
+
+        def spam():
+            g = torch.Generator().manual_seed(3)
+            while not stop.is_set():
+                nv.store.warm(torch.randint(0, nv.num_rows, (4096,), generator=g))
+                warmed[0] += 4096
+        ids_static = torch.zeros((1, 16), dtype=torch.long, device=dev)
+        out_static = torch.empty((1, 16, 160), dtype=torch.bfloat16, device=dev)
+        ref = torch.empty_like(out_static)
+        side = torch.cuda.Stream()
+        nv.gather(ids_static, out=out_static); torch.cuda.synchronize()
+        g2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g2):
+            nv.gather(ids_static, out=out_static)
+        th = threading.Thread(target=spam, daemon=True); th.start()
+        gen = torch.Generator().manual_seed(11)
+        bad = 0
+        for i in range(a.decode_steps):
+            ids = torch.randint(0, nv.num_rows, (1, 16), generator=gen)
+            if i % 2:   # half the steps reuse recently warmed-looking rows: repeat the previous ids
+                ids = last
+            last = ids
+            ids_static.copy_(ids.to(dev))
+            g2.replay()
+            host.gather(ids_static, out=ref)
+            torch.cuda.synchronize()
+            bad += int(not torch.equal(ref, out_static))
+        stop.set(); th.join()
+        res.update(hint_stress_steps=a.decode_steps, hint_stress_mismatch=bad, warmed_rows=warmed[0], stats=nv.stats())
+        print(json.dumps(res), flush=True)
+        json.dump(res, open(os.path.join(a.out, "result.json"), "w"), indent=1)
+        nv.release(); host.release()
+        print("DONE", flush=True)
+        return
 
     # --- 1. eager bit-exactness on real ids: a long prompt (prefill chunks) + decode-shaped lookups
     s = [x for x in streams if x["name"].startswith("L1")][0]
