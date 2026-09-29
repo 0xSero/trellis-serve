@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Qwen3.8-Flash-Next EXL3 (3.05bpw_h5_ng5) on ONE Arc Pro B70 through SGLang v0.5.20-xpu + exl3xpu:
 #   routed experts in USM host memory (tier 1) + device-managed LRU expert cache (EXL3_MOE_SLOTS slots, EXL3_MOE_CACHE=1),
-#   n-gram table in USM host memory (zero-copy gather + decode), dense EXL3 linears via exl3xpu_C.
+#   n-gram table in USM host memory (zero-copy gather + decode; EXL3_NGRAM_TIER=nvme: tier 2 = NVMe + 8 GB RAM row
+#   cache, needs exl3xpu/exl3xpu_ngram_nvme.so from scripts/build_ngram_nvme.sh), dense EXL3 linears via exl3xpu_C.
 # Foreground (run it in tmux):  serve_flashnext_b70.sh <run dir> [extra sglang args...]
 # Env: CARD (ZE_AFFINITY_MASK, default 1), PORT (30250), NAME (ftx-srv), IMAGE, MODEL, CTX, MEMFRAC, CHUNK, KVDTYPE,
 #      SLOTS (EXL3_MOE_SLOTS), MAXREQ; EXL3_* / SGLANG_* are forwarded.

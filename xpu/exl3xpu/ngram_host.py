@@ -228,8 +228,9 @@ def install() -> None:
                 logger.warning("n-gram hash constant %s differs from the file (%s vs %s): using the file's", name,
                                buf.cpu().tolist()[:4], ref.tolist()[:4])
                 buf.copy_(ref.to(buf.device))
-        logger.info("%s: n-gram table served from pinned host memory (EXL3 K=%d rows, zero-copy gather + decode)",
-                    prefix, table.K)
+        logger.info("%s: n-gram table served from %s (EXL3 K=%d rows, gather + decode on the GPU)", prefix,
+                    "NVMe + RAM row cache (tier 2)" if type(table).__name__ == "Exl3NgramNvmeTable"
+                    else "USM host memory (zero-copy)", table.K)
 
     cls.__init__ = __init__
     cls._exl3_patched = True
