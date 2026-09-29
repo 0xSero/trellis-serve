@@ -325,7 +325,8 @@ class ExpertStore:
         if self.n_slots:
             dp = self.slot_base + so.clamp_min(0).to(torch.int64) * self.blob
             sp = torch.where(so >= 0, dp, sp)
-        return sp.to(self.dev, non_blocking=True)      # CPU mirror only: no device->host read
+        # blocking H2D: a non_blocking copy from this pageable temporary may run after it is freed (XPU)
+        return sp.to(self.dev)
 
     def reset_cache(self) -> None:
         """Empty every slot and repoint all tables to host memory (current stream; waits for queued work)."""
@@ -353,16 +354,75 @@ class ExpertStore:
         pf = self._pf
         if pf["order"] is None or len(pf["order"]) != len(self.layer_index):
             pf["order"] = list(self.layer_index)
-            pf["layers"] = [k for k in pf["order"] if not str(k).startswith("mtp.")]
+            # model layer order, NOT insertion order (layers are packed as their shards finish loading, out of order)
+            import re as _re
+
+            def _lid(k):
+                m = _re.search(r"layers\.(\d+)\.", str(k))
+                return int(m.group(1)) if m else 1 << 30
+            pf["layers"] = sorted((k for k in pf["order"] if not str(k).startswith("mtp.")), key=_lid)
         cs = torch.xpu.current_stream()
         li = pf["order"].index(key)
+        if pf["layers"] and key == pf["layers"][0]:
+            # first MoE layer of a prefill forward: the device cache may have changed since the last staging -- decode
+            # runs as XPU graph replays (no Python here, so no mirror refresh) and SGLang's overlap scheduler can
+            # still have decode work queued. Sync, and if the cache's LRU tick moved, rebuild the host mirror of the
+            # slot map and drop pre-staged tables (their slot pointers may be stale). Within one prefill forward every
+            # MoE call is staged, so nothing else touches the cache until the forward ends.
+            torch.xpu.synchronize()
+            t = int(self.tick.item())
+            if pf.get("tick") != t or self._cache_used:
+                self.sync_mirror()
+                self._cache_used = False
+                pf["buf_of"].clear()
+                pf["ready"].clear()
+                pf["tick"] = t
         if key not in pf["buf_of"]:
             used = {b for b, _ in pf["buf_of"].values()}
             self._stage_into(key, 0 if 0 not in used else 1)
         buf, table = pf["buf_of"].pop(key)
-        cs.wait_event(pf["ready"].pop(key))
+        rdy = pf["ready"].pop(key)
+        if os.environ.get("EXL3_STAGE_VERIFY", "0") == "1":
+            import sys as _sys
+            print(f"EXL3_STAGE_LOG compute {key} from buf {buf} rows {x.shape[0]}", file=_sys.stderr, flush=True)
+        if os.environ.get("EXL3_STAGE_HOSTWAIT", "0") == "1":
+            rdy.synchronize()                 # host waits for the copy-engine transfer, then enqueues the compute
+        cs.wait_event(rdy)
+        if os.environ.get("EXL3_STAGE_CHECK", "0") == "1":
+            import sys as _sys
+            li_ = self.layer_index[key]
+            devt = self.ptrs_all[li_ * self.E:(li_ + 1) * self.E]
+            stg = s64(self._stage[buf].data_ptr())
+            in_stage = (table >= stg) & (table < stg + self.E * self.blob)
+            mism = (~in_stage) & (table != devt)
+            sod = self.slot_of_dev[li_ * self.E:(li_ + 1) * self.E]
+            print(f"EXL3_STAGE_CHECK {key}: staged-from-slot {int((~in_stage).sum())}, device-table-in-slot "
+                  f"{int(((devt >= self.slot_base) & (devt < self.slot_base + self.n_slots * self.blob)).sum())}, "
+                  f"slot_of_dev>=0 {int((sod >= 0).sum())}, mismatching slot pointers {int(mism.sum())}",
+                  file=_sys.stderr, flush=True)
         ids, w = self._rt(topk_ids, topk_w)
         y = self.X.moe_forward(x, ids, w, table, self.I, self.K, self.E)
+        if os.environ.get("EXL3_STAGE_VERIFY", "0") == "1":
+            import sys as _sys
+            y2 = self.X.moe_forward(x, ids, w, self._host_ptr[key].to(self.dev), self.I, self.K, self.E)
+            torch.xpu.synchronize()
+            li_ = self.layer_index[key]
+            stg = s64(self._stage[buf].data_ptr())
+            tab = table.cpu()
+            bad_e = []
+            for e in range(self.E):
+                p_ = int(tab[e])
+                if stg <= p_ < stg + self.E * self.blob:
+                    if not torch.equal(self._stage[buf][e].cpu(), self.host[key][e]):
+                        diff = (self._stage[buf][e].cpu() != self.host[key][e]).nonzero().flatten()
+                        bad_e.append((e, int(diff.numel()), int(diff[0]), int(diff[-1])))
+                else:
+                    s_ = (p_ - self.slot_base) // self.blob
+                    if not torch.equal(self.slots[s_].cpu(), self.host[key][e]):
+                        bad_e.append(("slot", e, s_))
+            print(f"EXL3_STAGE_VERIFY {key} rows {x.shape[0]} equal {torch.equal(y, y2)} "
+                  f"maxdiff {(y.float() - y2.float()).abs().max().item():.3g} corrupt {len(bad_e)} {bad_e[:4]}",
+                  file=_sys.stderr, flush=True)
         ev = torch.xpu.Event()
         ev.record(cs)
         pf["free"][buf] = ev                          # buffer reusable once this layer's kernels are done
@@ -379,10 +439,17 @@ class ExpertStore:
     def _stage_into(self, key, buf: int) -> None:
         pf = self._pf
         st = pf["stream"]
+        for k_ in [k_ for k_, (b_, _) in pf["buf_of"].items() if b_ == buf]:
+            pf["buf_of"].pop(k_)                  # an unconsumed pre-staged layer in this buffer is about to be overwritten
+            pf["ready"].pop(k_, None)
         if pf["free"][buf] is not None:
             st.wait_event(pf["free"][buf])
             pf["free"][buf] = None
         table = self.stage_layer(key, buf, st)       # copies the non-resident experts on the side stream
+        if os.environ.get("EXL3_STAGE_VERIFY", "0") == "1":
+            import sys as _sys
+            print(f"EXL3_STAGE_LOG stage {key} -> buf {buf} missing {int((self.slot_of[key] < 0).sum())}",
+                  file=_sys.stderr, flush=True)
         ev = torch.xpu.Event()
         ev.record(st)
         pf["buf_of"][key] = (buf, table)
