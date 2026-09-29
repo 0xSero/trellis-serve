@@ -1187,6 +1187,15 @@ def activate() -> None:
         logger.warning("exl3xpu: could not add 'exl3' to --quantization choices (%s)", e)
     if os.environ.get("EXL3_CUDA_SHIM", "1") == "1":
         _cuda_compat_shim()
+    if os.environ.get("EXL3_QSA_XPU", "1") == "1" and hasattr(torch, "xpu") and torch.xpu.is_available() \
+            and not torch.cuda.is_available():
+        try:
+            from . import qsa_xpu
+            qsa_xpu.install()
+            import sys as _sys
+            print("EXL3 qsa_xpu installed", file=_sys.stderr, flush=True)
+        except Exception as e:  # pragma: no cover
+            logger.warning("exl3xpu: QSA XPU shim not installed (%s)", e)
     if os.environ.get("EXL3_NGRAM_HOST", "1") == "1":
         # Qwen3.8-Flash-Next EXL3 n-gram table: USM host memory + zero-copy gather/decode (ngram_host.py)
         try:
