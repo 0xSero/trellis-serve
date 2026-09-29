@@ -46,6 +46,10 @@ class OffloadRuntime:
         # K07: fused decode prologue (SGLANG_EXL3_OFFLOAD_FUSED=1): one launch replaces id clean + align + cache step +
         # commit per layer at decode sizes
         self.fused_decode = _os.environ.get("SGLANG_EXL3_OFFLOAD_FUSED", "0") == "1"
+        # K08: fp16-accumulate grouped GEMM for the staged prefill (SGLANG_EXL3_MOE_PREFILL_FP16_ACC=1): cb + 10
+        self.prefill_acc16 = _os.environ.get("SGLANG_EXL3_MOE_PREFILL_FP16_ACC", "0") == "1"
+        # K08: part-wise prefill touching only each part's slots + one combine (SGLANG_EXL3_OFFLOAD_COMPACT_PARTS=1)
+        self.compact_parts = _os.environ.get("SGLANG_EXL3_OFFLOAD_COMPACT_PARTS", "0") == "1"
         self.P = staging_parts
         self.subchunk = prefill_subchunk     # tokens per GEMM pass inside a staged layer (bounds activation memory)
         self.part_e = self.E // staging_parts
@@ -125,7 +129,7 @@ class OffloadRuntime:
         sl = self.cache.slot_of[layer * self.E:(layer + 1) * self.E].to(torch.int64)
         bases = torch.where(sl >= 0, self.cache.arena.data_ptr() + sl * rec, self.staging[b].data_ptr() + self._erange * rec)
         table = om.fill_table_(self.ptables[b], bases, self.cache.offs)
-        y = om.run(x, w, ids, *al, block, table, self.lay, self.cb)
+        y = om.run(x, w, ids, *al, block, table, self.lay, self._pcb(block))
         self.release[b].record(cur)
         self.prefill_calls[layer] += 1
         return y
@@ -162,6 +166,8 @@ class OffloadRuntime:
         T, H = x.shape
         k = ids.shape[1]
         S = min(T, self.subchunk)
+        if self.compact_parts and S >= T:
+            return self._prefill_parts_compact(layer, x, ids, w, block)
         I = lay.inter
         f16 = dict(dtype=torch.float16, device=x.device)
         xh = torch.empty((2 * S * k, H), **f16)
@@ -192,14 +198,58 @@ class OffloadRuntime:
                 xhc = xh[: 2 * n]
                 gc, ac, xc = gu[:n], act[:n], xd[:n]
                 mod.moe_had_in_ptr(x[c0:c1], table, om.F_SUH13, 2, ic, xhc)
-                mod.moe_gemm_ptr(xhc, gc, table, om.F_W13, om.F_SVH13, lay.bits, s_ids, e_ids, npost, blk, I, self.cb)
+                mod.moe_gemm_ptr(xhc, gc, table, om.F_W13, om.F_SVH13, lay.bits, s_ids, e_ids, npost, blk, I, self._pcb(blk))
                 mod.moe_glu_had_in_ptr(gc, table, om.F_SUH2, ic, ac, xc)
                 yd = xhc[:n]
-                mod.moe_gemm_ptr(xc, yd, table, om.F_W2, om.F_SVH2, lay.bits, s_ids, e_ids, npost, blk, 0, self.cb)
+                mod.moe_gemm_ptr(xc, yd, table, om.F_W2, om.F_SVH2, lay.bits, s_ids, e_ids, npost, blk, 0, self._pcb(blk))
                 mod.moe_combine_acc(yd, w[c0:c1].contiguous(), ic, E, y32[c0:c1])
             self.release[b].record(cur)
         self.prefill_calls[layer] += 1
         return y32.to(x.dtype)
+
+    def _prefill_parts_compact(self, layer, x, ids, w, block):
+        """K08: every expert part runs had_in / glu over ITS slots only (compact kernels over the part's align output);
+        its down GEMM writes those slots' rows of the gate slab (already consumed by its gate/up GEMM), one moe_combine at
+        the end -> no fp32 accumulator, no per-part sweep over all slots."""
+        mod = om._mod()
+        P, pe, E, rec, lay = self.P, self.part_e, self.E, self.lay.record_bytes, self.lay
+        T, H = x.shape
+        k = ids.shape[1]
+        slots, I = T * k, lay.inter
+        f16 = dict(dtype=torch.float16, device=x.device)
+        xh = torch.empty((2 * slots, H), **f16)
+        gu = torch.empty((slots, 2 * I), **f16)
+        act, xd = torch.empty((slots, I), **f16), torch.empty((slots, I), **f16)
+        yd = xh[:slots]
+        sl = self.cache.slot_of[layer * E:(layer + 1) * E].to(torch.int64)
+        host_rows = self.cache.host_bases[layer] + self._erange * rec
+        part_of = torch.div(ids, pe, rounding_mode="floor")
+        cur = torch.cuda.current_stream()
+        cb = self._pcb(block)
+        for p in range(P):
+            b = self._pending.pop((layer, p))
+            nxt = (layer, p + 1) if p + 1 < P else (layer + 1, 0)
+            if nxt[0] < self.L:
+                self._issue_part(*nxt)
+            cur.wait_event(self.ready[b])
+            inpart = (self._erange >= p * pe) & (self._erange < (p + 1) * pe)
+            stage = self.staging[b].data_ptr() + (self._erange - p * pe) * rec
+            bases = torch.where(sl >= 0, self.cache.arena.data_ptr() + sl * rec, torch.where(inpart, stage, host_rows))
+            table = om.fill_table_(self.ptables[b], bases, self.cache.offs)
+            ids_p = torch.where(part_of == p, ids, torch.full_like(ids, E)).contiguous()
+            s_ids, e_ids, npost = _align(ids_p, block, E)
+            mod.moe_had_in_ptr_compact(x, table, om.F_SUH13, ids_p, s_ids, npost, xh)
+            mod.moe_gemm_ptr(xh, gu, table, om.F_W13, om.F_SVH13, lay.bits, s_ids, e_ids, npost, block, I, cb)
+            mod.moe_glu_had_in_ptr_compact(gu, table, om.F_SUH2, ids_p, s_ids, npost, act, xd)
+            mod.moe_gemm_ptr(xd, yd, table, om.F_W2, om.F_SVH2, lay.bits, s_ids, e_ids, npost, block, 0, cb)
+            self.release[b].record(cur)
+        y = torch.empty_like(x)
+        mod.moe_combine(yd, w, ids, E, y)
+        self.prefill_calls[layer] += 1
+        return y
+
+    def _pcb(self, block: int) -> int:
+        return self.cb + 10 if (self.prefill_acc16 and block > 8 and self.cb in (1, 2)) else self.cb
 
     # ---- counters
     def stats(self, reset: bool = False) -> dict:
