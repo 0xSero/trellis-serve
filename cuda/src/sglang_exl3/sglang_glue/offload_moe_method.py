@@ -48,9 +48,21 @@ def is_offloaded_expert_key(name: str) -> bool:
         and not name.startswith("mtp.") and "shared_expert" not in name
 
 
-def _slots_from_env(record_bytes: int) -> int:
-    if os.environ.get("SGLANG_EXL3_EXPERT_CACHE_GB"):             # integration contract: byte budget
-        return int(float(os.environ["SGLANG_EXL3_EXPERT_CACHE_GB"]) * 1e9 // record_bytes)
+def _slots_from_env(record_bytes: int, staging_bytes: int = 0) -> int:
+    v = os.environ.get("SGLANG_EXL3_EXPERT_CACHE_GB", "")
+    if v.strip().lower() == "auto":
+        # auto-fit: free VRAM now (weights loaded, before KV / mamba / graphs are sized) minus the prefill staging and
+        # a reserve for everything SGLang allocates later (SGLANG_EXL3_EXPERT_CACHE_RESERVE_GB; the default is
+        # calibrated on the 3090 serve config: KV 210k fp8, mamba 16, 8k chunks, graphs bs 1-3)
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info()
+        reserve = float(os.environ.get("SGLANG_EXL3_EXPERT_CACHE_RESERVE_GB", "8.9")) * 1e9
+        nbytes = max(0, free - staging_bytes - reserve)
+        logger.info("EXL3 offload: expert cache auto-fit: free %.2f GB of %.2f, staging %.2f GB, reserve %.2f GB -> %.2f GB",
+                    free / 1e9, total / 1e9, staging_bytes / 1e9, reserve / 1e9, nbytes / 1e9)
+        return int(nbytes // record_bytes)
+    if v:                                                          # integration contract: byte budget
+        return int(float(v) * 1e9 // record_bytes)
     if os.environ.get("SGLANG_EXL3_OFFLOAD_SLOTS"):
         return int(os.environ["SGLANG_EXL3_OFFLOAD_SLOTS"])
     gb = float(os.environ.get("SGLANG_EXL3_OFFLOAD_CACHE_GB", "8"))
@@ -73,7 +85,9 @@ def get_runtime(config, num_experts: int, hidden: int, inter: int, bits: int, co
     model_dir = getattr(config, "model_path", None) or config.path
     store = HostExpertStore(model_dir, layers, num_experts, hidden, inter, bits, prefix=prefix)
     st = store.load()
-    slots = _slots_from_env(store.lay.record_bytes)
+    parts = int(os.environ.get("SGLANG_EXL3_OFFLOAD_STAGING_PARTS", "1"))
+    staging_bytes = 2 * (-(-num_experts // parts)) * store.lay.record_bytes
+    slots = _slots_from_env(store.lay.record_bytes, staging_bytes)
     rt = OffloadRuntime(store, slots, codebook, prefill_min_tokens=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_MIN", "192")),
                         staging_parts=int(os.environ.get("SGLANG_EXL3_OFFLOAD_STAGING_PARTS", "1")),
                         prefill_subchunk=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_SUBCHUNK", str(1 << 30))))

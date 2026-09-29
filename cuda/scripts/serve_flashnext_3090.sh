@@ -9,7 +9,7 @@
 # Foreground (run it under bench/gpu1_run.sh in tmux so the GPU lock is held exactly as long as the server lives):
 #   serve_flashnext_3090.sh <run dir> [extra sglang args...]
 # Env: GPU (1), PORT (30100), IMAGE (sglang-exl3:dev), NAME (ft-int-serve), MODEL (dir under ~/models),
-#      CTX (204800), MEMFRAC (0.88), CHUNK (8192), THREADS (24), GRAPH_BS (8), KVDTYPE (fp8_e4m3), MAMBA (16), MAXTOK (210000 KV tokens), CACHE_GB (10.5),
+#      CTX (204800), MEMFRAC (0.88), CHUNK (8192), THREADS (24), GRAPH_BS (8), KVDTYPE (fp8_e4m3), MAMBA (16), MAXTOK (210000 KV tokens), CACHE_GB (auto = free VRAM - staging - 8.9 GB reserve; 10.5 GB on omarchy),
 #      DOCKER_ENV (extra "-e K=V ..." docker args); SGLANG_* / EXL3_* are forwarded.
 set -uo pipefail
 RUN=${1:?run dir}; shift; mkdir -p "$RUN"
@@ -28,7 +28,7 @@ ARGV=(docker run --rm --name "$NAME" --gpus "device=$GPU" --ipc=host --shm-size 
   -p 127.0.0.1:$PORT:$PORT
   -e HF_HUB_OFFLINE=1 -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e SGLANG_EXL3_MODEL_PATH=/models/$MODEL
   -e SGLANG_EXL3_MOE_OFFLOAD=${SGLANG_EXL3_MOE_OFFLOAD:-gpu_cache} -e EXL3_MOE_CPU_THREADS=${THREADS:-24}
-  -e SGLANG_EXL3_EXPERT_CACHE_GB=${CACHE_GB:-10.5} -e SGLANG_EXL3_EMBED_HOST=${SGLANG_EXL3_EMBED_HOST:-1}
+  -e SGLANG_EXL3_EXPERT_CACHE_GB=${CACHE_GB:-auto} -e SGLANG_EXL3_EMBED_HOST=${SGLANG_EXL3_EMBED_HOST:-1}
   -e SGLANG_EXL3_OFFLOAD_STAGING_PARTS=${SGLANG_EXL3_OFFLOAD_STAGING_PARTS:-4}
   -e SGLANG_EXL3_NGRAM_TIER=${SGLANG_EXL3_NGRAM_TIER:-nvme}
   -e PYTHONPATH=/opt/trellis-serve/cuda/csrc/build/lib -e SGLANG_EXL3_JIT_DIR=/opt/trellis-serve/cuda/csrc/build/jit
