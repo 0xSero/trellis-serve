@@ -219,8 +219,9 @@ void trellis_moe_had_in_kernel(const half* __restrict__ x, half* __restrict__ xh
   const int slot = blockIdx.x % slots, shard = blockIdx.x / slots;
   int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
   // An id outside [0, E) (padding / dummy tokens, expert-parallel sentinels) is dropped by moe_align_block_size, so the
-  // GEMM never reads this slot and moe_combine skips it; clamp so the scale lookup stays inside suh.
-  if (e < 0 || e >= num_experts) e = 0;
+  // GEMM never reads this slot and moe_combine skips it: write nothing (a part-wise prefill relies on other parts' rows
+  // staying untouched).
+  if (e < 0 || e >= num_experts) return;
   const half* in = x + width * (slot / top_k) + blockIdx.y * 128;
   half* out = xh + width * blockIdx.x + blockIdx.y * 128;
   const half* su = ptrs ? reinterpret_cast<const half*>(ptrs[e * pstride]) + width * shard : suh + width * (e * shards + shard);
@@ -246,7 +247,7 @@ void trellis_moe_glu_had_in_kernel(const half* __restrict__ gu, half* __restrict
   const int slot = blockIdx.x;
   const int t = threadIdx.x & 31;
   int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
-  if (e < 0 || e >= num_experts) e = 0;  // dropped slot (see moe_had_in): its gu row was never written, result unused
+  if (e < 0 || e >= num_experts) return;  // dropped slot (see moe_had_in): nothing to write
   const half4 g = ((const half4*)(gu + 2 * inter * slot + blockIdx.y * 128))[t];
   const half4 u = ((const half4*)(gu + 2 * inter * slot + inter + blockIdx.y * 128))[t];
   float2 g0 = __half22float2(g.x), g1 = __half22float2(g.y), u0 = __half22float2(u.x), u1 = __half22float2(u.y);
@@ -295,6 +296,34 @@ void trellis_moe_combine_kernel(const half* __restrict__ yd, const float* __rest
   }
 }
 
+// y32[t] += sum_j w[t, j] * yd[t * top_k + j] (fp32 in / out): part-wise prefill accumulates every expert part into one
+// fp32 output; slots outside [0, E) (other parts, dropped) are skipped. grid (tokens, hidden / 128).
+template <bool ids64>
+__global__ __launch_bounds__(32)
+void trellis_moe_combine_acc_kernel(const half* __restrict__ yd, const float* __restrict__ w, float* __restrict__ y32,
+                                    const void* __restrict__ ids, const int top_k, const int num_experts) {
+  const size_t hidden = (size_t)gridDim.y * 128;
+  const int tok = blockIdx.x;
+  const int t = threadIdx.x & 31;
+  float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+  bool any = false;
+  for (int j = 0; j < top_k; j++) {
+    const size_t slot = (size_t)tok * top_k + j;
+    const int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
+    if (e < 0 || e >= num_experts) continue;
+    any = true;
+    const half4 v = ((const half4*)(yd + hidden * slot + blockIdx.y * 128))[t];
+    const float wj = w[(size_t)tok * top_k + j];
+    float2 lo = __half22float2(v.x), hi = __half22float2(v.y);
+    s0 += wj * lo.x; s1 += wj * lo.y; s2 += wj * hi.x; s3 += wj * hi.y;
+  }
+  if (!any) return;
+  float4* o = reinterpret_cast<float4*>(y32 + hidden * tok + blockIdx.y * 128) + t;
+  float4 v = *o;
+  v.x += s0; v.y += s1; v.z += s2; v.w += s3;
+  *o = v;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Grid-strided variants (prefill): instead of one 32-thread block per (row, 128-block) item - 4.2 M blocks per layer at
 // 8k tokens - a FIXED grid of 256-thread blocks (8 warps each) strides over the items, as the dense template's
@@ -326,7 +355,7 @@ void trellis_moe_had_in_gs_kernel(const half* __restrict__ x, half* __restrict__
     const int64_t rs = w / kb;
     const int slot = (int)(rs % slots), shard = (int)(rs / slots);
     int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
-    if (e < 0 || e >= num_experts) e = 0;
+    if (e < 0 || e >= num_experts) continue;  // dropped slot: write nothing
     const half* su = ptrs ? reinterpret_cast<const half*>(ptrs[e * pstride]) + width * shard : suh + width * (e * shards + shard);
     trellis_had_r_128_inner<in_bf16, false, true, false>(x + width * (slot / top_k) + blk * 128, xh + width * rs + blk * 128,
                                                         su, blk * 32, kHadScale);
@@ -345,7 +374,7 @@ void trellis_moe_glu_had_in_gs_kernel(const half* __restrict__ gu, half* __restr
     const int blk = (int)(w % kb);
     const int64_t slot = w / kb;
     int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
-    if (e < 0 || e >= num_experts) e = 0;
+    if (e < 0 || e >= num_experts) continue;  // dropped slot: write nothing
     const half4 g = ((const half4*)(gu + 2 * inter * slot + blk * 128))[t];
     const half4 u = ((const half4*)(gu + 2 * inter * slot + inter + blk * 128))[t];
     float2 g0 = __half22float2(g.x), g1 = __half22float2(g.y), u0 = __half22float2(u.x), u1 = __half22float2(u.y);
@@ -490,6 +519,23 @@ void moe_glu_had_in(const at::Tensor& gu, const at::Tensor& suh, const at::Tenso
   const at::cuda::OptionalCUDAGuard device_guard(gu.device());
   TORCH_CHECK(suh.dim() == 2 && suh.dtype() == at::kHalf && suh.is_contiguous() && suh.size(1) * 2 == gu.size(1));
   glu_launch(gu, (const half*)suh.data_ptr(), suh.size(0), ids, act_tmp, xd, nullptr, 0);
+}
+
+void moe_combine_acc(const at::Tensor& yd, const at::Tensor& w, const at::Tensor& ids, int64_t num_experts, at::Tensor& y32) {
+  const at::cuda::OptionalCUDAGuard device_guard(yd.device());
+  TORCH_CHECK(yd.dim() == 2 && yd.dtype() == at::kHalf && yd.is_contiguous() && yd.size(1) % 128 == 0);
+  TORCH_CHECK(w.dim() == 2 && w.dtype() == at::kFloat && w.is_contiguous());
+  TORCH_CHECK(y32.dim() == 2 && y32.dtype() == at::kFloat && y32.is_contiguous() && y32.size(1) == yd.size(1));
+  const int64_t tokens = y32.size(0), top_k = w.size(1);
+  TORCH_CHECK(w.size(0) == tokens && yd.size(0) >= tokens * top_k);
+  TORCH_CHECK(is_index(ids) && ids.is_contiguous() && ids.numel() == tokens * top_k);
+  if (tokens == 0) return;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  dim3 grid((unsigned)tokens, (unsigned)(y32.size(1) / 128));
+  if (ids.dtype() == at::kLong)
+    trellis_moe_combine_acc_kernel<true><<<grid, 32, 0, stream>>>((const half*)yd.data_ptr(), w.data_ptr<float>(), y32.data_ptr<float>(), ids.data_ptr(), (int)top_k, (int)num_experts);
+  else
+    trellis_moe_combine_acc_kernel<false><<<grid, 32, 0, stream>>>((const half*)yd.data_ptr(), w.data_ptr<float>(), y32.data_ptr<float>(), ids.data_ptr(), (int)top_k, (int)num_experts);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -911,6 +957,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_had_in", &moe_had_in, "per-slot input transform with per-expert suh (gather + scale + Had128)");
   m.def("moe_glu_had_in", &moe_glu_had_in, "silu(gate) * up -> fp16 -> per-expert suh -> Had128 (down input)");
   m.def("moe_combine", &moe_combine, "router-weighted fp32 sum over a token's top-k slots");
+  m.def("moe_combine_acc", &moe_combine_acc, "y32 += router-weighted sum over a token's valid top-k slots (fp32 accumulate)");
   m.def("moe_gemm_ptr", &moe_gemm_ptr, "grouped EXL3 GEMM, experts addressed through an int64 pointer table [E, F]",
         py::arg("a"), py::arg("c"), py::arg("ptrs"), py::arg("field_b"), py::arg("field_s"), py::arg("bits"),
         py::arg("sorted_ids"), py::arg("expert_ids"), py::arg("num_post_padded"), py::arg("moe_block_size"),

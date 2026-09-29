@@ -74,7 +74,9 @@ def get_runtime(config, num_experts: int, hidden: int, inter: int, bits: int, co
     store = HostExpertStore(model_dir, layers, num_experts, hidden, inter, bits, prefix=prefix)
     st = store.load()
     slots = _slots_from_env(store.lay.record_bytes)
-    rt = OffloadRuntime(store, slots, codebook, prefill_min_tokens=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_MIN", "192")))
+    rt = OffloadRuntime(store, slots, codebook, prefill_min_tokens=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_MIN", "192")),
+                        staging_parts=int(os.environ.get("SGLANG_EXL3_OFFLOAD_STAGING_PARTS", "1")),
+                        prefill_subchunk=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_SUBCHUNK", str(1 << 30))))
     logger.info("EXL3 offload: %d layers x %d experts pinned (%.1f GB) in %.1fs (read wait %.1fs, relayout %.1fs, "
                 "register %.1fs); cache %d slots (%.1f GB)", store.L, num_experts, store.L * store.bank_bytes / 1e9,
                 st.seconds_total, st.seconds_read_wait, st.seconds_relayout, st.seconds_register, slots,

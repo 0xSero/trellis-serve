@@ -76,6 +76,8 @@ def fake_method(model, layer_id, slots):
     -> create_moe_runner -> process_weights_after_loading -> apply)."""
     os.environ["SGLANG_EXL3_MOE_OFFLOAD"] = "1"
     os.environ["SGLANG_EXL3_OFFLOAD_SLOTS"] = str(slots)
+    os.environ["SGLANG_EXL3_OFFLOAD_STAGING_PARTS"] = str(getattr(fake_method, "parts", 1))
+    os.environ["SGLANG_EXL3_OFFLOAD_PREFILL_SUBCHUNK"] = str(getattr(fake_method, "subchunk", 1 << 30))
     from ..sglang_glue.config import Exl3Config
     from ..sglang_glue.offload_moe_method import Exl3OffloadMoEMethod
     cfg = Exl3Config({}, model)
@@ -102,6 +104,8 @@ def fake_method(model, layer_id, slots):
 def mode_correct(a):
     res = {}
     ms, layers = {}, {}
+    fake_method.parts = a.parts
+    fake_method.subchunk = a.subchunk
     for l in (3, 17, 40):
         ms[l], layers[l] = fake_method(a.model, l, a.slots)
     rt = layers[3].exl3_offload
@@ -134,7 +138,12 @@ def mode_correct(a):
             block = marlin_moe.moe_block_size(T, 10, 512)
             al = _align(ids, block, 512)
             y = rt.forward(layers[l].exl3_store_index, x, ids, w, routing=al, force="prefill")
-            ok_pre &= eq16(y, marlin_moe.run(x, w, ids, *al, block, packs[l]))
+            ys = marlin_moe.run(x, w, ids, *al, block, packs[l])
+            ok_pre &= eq16(y, ys)
+            res.setdefault("prefill_rel_diff_max", 0.0)
+            res["prefill_rel_diff_max"] = max(res["prefill_rel_diff_max"],
+                                              float((y.float() - ys.float()).abs().mean() / ys.float().abs().mean()))
+            res["prefill_finite"] = bool(torch.isfinite(y).all()) and res.get("prefill_finite", True)
     res["prefill_eq_stacked"] = bool(ok_pre)
     # graph: 3-layer decode step
     T = 1
@@ -164,7 +173,9 @@ def mode_correct(a):
             ok_g &= eq16(ys[i], marlin_moe.run(xs[i], wb[i], idb[i], *_align(idb[i], block, 512), block, packs[l]))
     res["graph_eq_stacked"] = bool(ok_g)
     res["stats"] = {k: v for k, v in rt.stats().items() if k in ("decode_hit_rate", "resident", "slots")}
-    res["pass"] = ok_dec and ok_pre and ok_g
+    res["parts"] = a.parts
+    res["subchunk"] = a.subchunk
+    res["pass"] = ok_dec and ok_g and (ok_pre if (a.parts == 1 and a.subchunk >= 4096) else (res["prefill_rel_diff_max"] < 2e-3 and res["prefill_finite"]))
     print("CORRECT", json.dumps(res), flush=True)
     return res
 
@@ -244,7 +255,10 @@ def mode_prefill(a):
     dec = np.concatenate([r["decode_ids"] for r in reqs]).astype(np.int32)[: a.warm_steps]
     decw = np.concatenate([r["decode_w"] for r in reqs]).astype(np.float32)[: a.warm_steps]
     out = {"results": [], "crossover": []}
-    rt = OffloadRuntime(st, a.slots, 2, prefill_min_tokens=a.prefill_min)
+    rt = OffloadRuntime(st, a.slots, 2, prefill_min_tokens=a.prefill_min, staging_parts=a.parts, prefill_subchunk=a.subchunk)
+    out["subchunk"] = a.subchunk
+    out["parts"] = a.parts
+    out["staging_GB"] = sum(t.numel() for t in rt.staging) / 1e9
     # warm the cache with decode steps (eager is fine here)
     for t in range(dec.shape[0]):
         for l in range(48):
@@ -259,20 +273,25 @@ def mode_prefill(a):
         w = torch.from_numpy(prw[off:off + T]).cuda()
         x = (torch.randn((T, 2560), generator=gen) * 0.5).bfloat16().cuda()
         torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
         e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         e0.record()
         for l in range(48):
             rt.forward(l, x, ids[:, l].contiguous(), w[:, l].contiguous(), force=force)
         e1.record(); torch.cuda.synchronize()
+        run48.peak_GB = max(getattr(run48, "peak_GB", 0.0), (torch.cuda.max_memory_allocated() - base) / 1e9)
         return e0.elapsed_time(e1)
 
     for T in [int(v) for v in a.chunks.split(",")]:
         rt.stats(reset=True)
+        run48.peak_GB = 0.0
         ts = [run48(T, (i * 3000) % max(1, pre.shape[0] - T), "prefill") for i in range(a.reps + 1)][1:]
         stt = rt.stats()
         copied = np.array(stt["prefill_copied"]).sum() / max(1, np.array(stt["prefill_calls"]).sum())
         r = {"tokens": T, "slots": a.slots, "ms_per_chunk": statistics.median(ts), "tok_per_s": T / statistics.median(ts) * 1e3,
-             "copied_experts_per_layer": copied, "ms_all": [round(v, 1) for v in ts]}
+             "copied_experts_per_layer": copied, "ms_all": [round(v, 1) for v in ts],
+             "activation_peak_GB": round(run48.peak_GB, 3)}
         out["results"].append(r)
         print("PREFILL", json.dumps(r), flush=True)
     for T in [int(v) for v in a.crossover.split(",") if v]:
@@ -298,6 +317,8 @@ def main():
     ap.add_argument("--crossover", default="32,64,128,256,512,1024")
     ap.add_argument("--prefill-min", type=int, default=128)
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--parts", type=int, default=1)
+    ap.add_argument("--subchunk", type=int, default=1 << 30)
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
     fn = {"load": mode_load, "correct": mode_correct, "decode": mode_decode, "prefill": mode_prefill}[a.mode]

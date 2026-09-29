@@ -29,7 +29,8 @@ def _align(ids, block, num_experts):
 
 class OffloadRuntime:
     def __init__(self, store: HostExpertStore, slots: int, codebook: int = 2, top_k: int = 10,
-                 prefill_min_tokens: int = 192, staging: bool = True, device=None):
+                 prefill_min_tokens: int = 192, staging: bool = True, device=None, staging_parts: int = 1,
+                 prefill_subchunk: int = 1 << 30):
         self.store, self.lay, self.cb, self.top_k = store, store.lay, codebook, top_k
         self.L, self.E = store.L, store.E
         dev = torch.device(device or "cuda")
@@ -37,7 +38,14 @@ class OffloadRuntime:
         self.cache = om.ExpertCache(self.L, self.E, self.lay, [store.base_address(i) for i in range(self.L)], slots, dev)
         self.prefill_min_tokens = prefill_min_tokens
         rec = self.lay.record_bytes
-        self.staging = [torch.empty((self.E, rec), dtype=torch.uint8, device=dev) for _ in range(2)] if staging else []
+        # staging_parts P: the layer's experts are staged in P parts through 2 buffers of E / P records (P = 1: two full
+        # layer buffers, 1.91 GB; P = 4: 0.48 GB), the grouped kernel runs once per part (K06b)
+        if self.E % staging_parts:
+            raise ValueError("staging_parts must divide the expert count")
+        self.P = staging_parts
+        self.subchunk = prefill_subchunk     # tokens per GEMM pass inside a staged layer (bounds activation memory)
+        self.part_e = self.E // staging_parts
+        self.staging = [torch.empty((self.part_e, rec), dtype=torch.uint8, device=dev) for _ in range(2)] if staging else []
         self.ptables = [om.new_table(self.E, dev) for _ in range(2)]
         self.copy_stream = torch.cuda.Stream(device=dev)
         self.ready = [torch.cuda.Event() for _ in range(2)]
@@ -73,6 +81,8 @@ class OffloadRuntime:
                                                and bool(self.staging))
         if not use_prefill:
             return self.cache.run(layer, x, w, ids, *al, block, self.cb)
+        if self.P > 1 or T > self.subchunk:
+            return self._prefill_parts(layer, x, ids, w, block)
         return self._prefill(layer, x, ids, w, al, block)
 
     def _issue(self, layer: int) -> None:
@@ -110,6 +120,77 @@ class OffloadRuntime:
         self.release[b].record(cur)
         self.prefill_calls[layer] += 1
         return y
+
+    # ---- part-wise staged prefill (staging_parts > 1)
+    def _issue_part(self, layer: int, part: int) -> None:
+        g = layer * self.P + part
+        b = g % 2
+        lo = part * self.part_e
+        miss = np.nonzero(self._snapshot[layer, lo:lo + self.part_e] < 0)[0]
+        self.prefill_copied[layer] += len(miss)
+        self.prefill_resident[layer] += self.part_e - len(miss)
+        bank, stg = self.store.bank(layer), self.staging[b]
+        with torch.cuda.stream(self.copy_stream):
+            self.copy_stream.wait_event(self.release[b])
+            if len(miss):
+                brk = np.nonzero(np.diff(miss) != 1)[0] + 1
+                for run in np.split(miss, brk):
+                    a, z = int(run[0]), int(run[-1]) + 1
+                    stg[a:z].copy_(bank[lo + a:lo + z], non_blocking=True)
+            self.ready[b].record(self.copy_stream)
+        self._pending[(layer, part)] = b
+
+    def _prefill_parts(self, layer, x, ids, w, block):
+        """Expert part p (staging buffer (layer * P + p) % 2) x token sub-chunk c (<= subchunk tokens): had_in -> gate/up ->
+        glu -> down on the sub-chunk's slots routed to part p, then y32[c] += combine (fp32). Activation memory is that of
+        one sub-chunk; the staging copy of the next part overlaps the current part's GEMMs."""
+        mod = om._mod()
+        P, pe, E, rec, lay = self.P, self.part_e, self.E, self.lay.record_bytes, self.lay
+        if (layer, 0) not in self._pending:
+            self._pending.clear()
+            self._snapshot = self.cache.slot_of.view(self.L, E).cpu().numpy()
+            self._issue_part(layer, 0)
+        T, H = x.shape
+        k = ids.shape[1]
+        S = min(T, self.subchunk)
+        I = lay.inter
+        f16 = dict(dtype=torch.float16, device=x.device)
+        xh = torch.empty((2 * S * k, H), **f16)
+        gu = torch.empty((S * k, 2 * I), **f16)
+        act, xd = torch.empty((S * k, I), **f16), torch.empty((S * k, I), **f16)
+        y32 = torch.zeros((T, H), dtype=torch.float32, device=x.device)
+        sl = self.cache.slot_of[layer * E:(layer + 1) * E].to(torch.int64)
+        host_rows = self.cache.host_bases[layer] + self._erange * rec
+        part_of = torch.div(ids, pe, rounding_mode="floor")
+        cur = torch.cuda.current_stream()
+        for p in range(P):
+            b = self._pending.pop((layer, p))
+            nxt = (layer, p + 1) if p + 1 < P else (layer + 1, 0)
+            if nxt[0] < self.L:
+                self._issue_part(*nxt)
+            cur.wait_event(self.ready[b])
+            inpart = (self._erange >= p * pe) & (self._erange < (p + 1) * pe)
+            stage = self.staging[b].data_ptr() + (self._erange - p * pe) * rec
+            bases = torch.where(sl >= 0, self.cache.arena.data_ptr() + sl * rec, torch.where(inpart, stage, host_rows))
+            table = om.fill_table_(self.ptables[b], bases, self.cache.offs)
+            ids_p = torch.where(part_of == p, ids, torch.full_like(ids, E))
+            for c0 in range(0, T, S):
+                c1 = min(T, c0 + S)
+                n = (c1 - c0) * k
+                ic = ids_p[c0:c1].contiguous()
+                blk = marlin_moe.moe_block_size(c1 - c0, k, E)
+                s_ids, e_ids, npost = _align(ic, blk, E)
+                xhc = xh[: 2 * n]
+                gc, ac, xc = gu[:n], act[:n], xd[:n]
+                mod.moe_had_in_ptr(x[c0:c1], table, om.F_SUH13, 2, ic, xhc)
+                mod.moe_gemm_ptr(xhc, gc, table, om.F_W13, om.F_SVH13, lay.bits, s_ids, e_ids, npost, blk, I, self.cb)
+                mod.moe_glu_had_in_ptr(gc, table, om.F_SUH2, ic, ac, xc)
+                yd = xhc[:n]
+                mod.moe_gemm_ptr(xc, yd, table, om.F_W2, om.F_SVH2, lay.bits, s_ids, e_ids, npost, blk, 0, self.cb)
+                mod.moe_combine_acc(yd, w[c0:c1].contiguous(), ic, E, y32[c0:c1])
+            self.release[b].record(cur)
+        self.prefill_calls[layer] += 1
+        return y32.to(x.dtype)
 
     # ---- counters
     def stats(self, reset: bool = False) -> dict:
