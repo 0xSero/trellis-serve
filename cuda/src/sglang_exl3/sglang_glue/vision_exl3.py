@@ -135,6 +135,26 @@ def _dump_hook(visual, path: str) -> None:
     visual.forward = forward
 
 
+def _inject_hook(visual, path: str) -> None:
+    """Debug (SGLANG_EXL3_VISION_INJECT=<dir>): replace each ViT output by the reference embeddings in <dir>/*.pt
+    (e.g. exllamav3's, [n_tokens, out_hidden]) with the same shape and the highest mean cosine similarity, to split a
+    ViT-vs-LM discrepancy. Outputs with no same-shape reference pass through unchanged."""
+    refs = [torch.load(os.path.join(path, f)).float() for f in sorted(os.listdir(path)) if f.endswith(".pt")]
+    orig = visual.forward
+
+    def forward(*a, **k):
+        y = orig(*a, **k)
+        cands = [r for r in refs if r.shape == y.shape]
+        if not cands:
+            return y
+        yf = y.float()
+        cos = [torch.nn.functional.cosine_similarity(yf, r.to(y.device), dim=-1).mean().item() for r in cands]
+        best = max(range(len(cands)), key=cos.__getitem__)
+        logger.info("sglang-exl3: ViT output %s replaced by reference embeddings (cos %.5f)", tuple(y.shape), cos[best])
+        return cands[best].to(y.device, y.dtype)
+    visual.forward = forward
+
+
 def _patch_load(cls) -> None:
     if "_exl3_vision" in cls.__dict__:
         return
@@ -181,6 +201,8 @@ def _patch_load(cls) -> None:
                 _to_fp16(self.visual)
             if os.environ.get("SGLANG_EXL3_VISION_DUMP"):
                 _dump_hook(self.visual, os.environ["SGLANG_EXL3_VISION_DUMP"])
+            if os.environ.get("SGLANG_EXL3_VISION_INJECT"):
+                _inject_hook(self.visual, os.environ["SGLANG_EXL3_VISION_INJECT"])
         return out
 
     cls.__init__, cls.load_weights, cls._exl3_vision = __init__, load_weights, True
