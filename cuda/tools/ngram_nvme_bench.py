@@ -168,6 +168,10 @@ def main():
     ap.add_argument("--io", default="aio")
     ap.add_argument("--chunks", default="8192,16384")
     ap.add_argument("--repeat", type=int, default=1, help="replay the streams this many times (warm-cache view)")
+    ap.add_argument("--corpus", default="", help="hitrate mode: comma list of dirs; *.py/*.md/*.txt/*.rst files are "
+                    "tokenised as warm-up traffic before the K02 streams")
+    ap.add_argument("--prefill-tps", type=float, default=2500.0)
+    ap.add_argument("--corpus-tokens", type=int, default=20_000_000)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     streams = build_streams(a.model, a.workloads, a.k02)
@@ -211,6 +215,89 @@ def main():
             bad += verify(tab, x, slots, rows)
         res.update(replays=out, random_ids=int(ids.numel()), random_bad=bad)
         tab.release()
+    elif a.mode == "hitrate":
+        # dry cache simulation (no reads): warm-up traffic from a text/code corpus, then the K02 streams
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(os.path.join(a.model, "tokenizer.json"))
+        files = []
+        for d in filter(None, a.corpus.split(",")):
+            for root, _, fs in os.walk(d):
+                for f in sorted(fs):
+                    if f.endswith((".py", ".md", ".txt", ".rst")):
+                        files.append(os.path.join(root, f))
+        rng = np.random.default_rng(0)
+        rng.shuffle(files)
+        tab0 = make_table(a.model, 0.03, a.io, 16384)
+        docs, ntok, B = [], 0, 256
+        for i in range(0, len(files), B):
+            texts = []
+            for f in files[i:i + B]:
+                try:
+                    texts.append(open(f, errors="ignore").read()[:400000])
+                except OSError:
+                    pass
+            for e in tok.encode_batch(texts, add_special_tokens=False):
+                if len(e.ids) < 16:
+                    continue
+                docs.append(tab0.hash_tokens(e.ids, eos=EOS).reshape(-1))
+                ntok += len(e.ids)
+            if ntok >= a.corpus_tokens:
+                break
+        tab0.release()
+        print("corpus", len(docs), "docs", ntok, "tokens", flush=True)
+        out = []
+        for gb in [float(x) for x in a.budgets.split(",")]:
+            tab = make_table(a.model, gb, a.io, 16384)
+            tab.store.set_dry(True)
+            slots = torch.empty(tab.cap, dtype=torch.long)
+            t0 = time.time()
+            marks = {}
+            seen = 0
+            for d in docs:
+                for c0 in range(0, d.numel(), tab.cap):
+                    tab.store.resolve(d[c0:c0 + tab.cap].contiguous(), slots)
+                seen += d.numel() // 16
+                for m in (1_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000):
+                    if seen >= m and m not in marks:
+                        marks[m] = tab.stats(gpu=False)["lookup_hit_rate"]
+            corpus_hit = tab.stats(gpu=False)["lookup_hit_rate"]
+            tab.reset_stats()
+            r = replay(tab, streams, 16384)
+            o = dict(budget_gb=gb, slots=tab.nslots, corpus_tokens=ntok, corpus_lookup_hit=corpus_hit,
+                     corpus_hit_marks=marks, k02_prefill_hit=r["prefill_lookup_hit"],
+                     k02_decode_hit=r["decode_lookup_hit"], resident=tab.stats(gpu=False)["resident"],
+                     sim_s=time.time() - t0)
+            out.append(o)
+            print(json.dumps(o), flush=True)
+            tab.release()
+        res.update(hitrate=out)
+    elif a.mode == "hint":
+        # prefill with a schedule-time hint: chunk i+1 is warmed asynchronously while chunk i "computes"
+        # (sleep = chunk tokens / --prefill-tps), then chunk i+1's lookup is timed. Cold = no hint, same cache start.
+        out = []
+        for chunk in [int(x) for x in a.chunks.split(",")]:
+            for hint in (False, True):
+                tab = make_table(a.model, 4.0, a.io, chunk)
+                slots = torch.empty(tab.cap, dtype=torch.long)
+                for s_ in streams:
+                    if s_["cat"] != "long":
+                        continue
+                    toks = s_["prompt"]
+                    ids_p = tab.hash_tokens(toks, eos=EOS)
+                    n = ids_p.shape[0]
+                    for c0 in range(0, n, chunk):
+                        x = ids_p[c0:c0 + chunk].reshape(-1).contiguous()
+                        t0 = time.perf_counter(); tab.store.resolve(x, slots); dt = time.perf_counter() - t0
+                        fut = None
+                        if hint and c0 + chunk < n:
+                            fut = tab.hint_tokens(toks[c0 + chunk:c0 + 2 * chunk], history=toks[c0 + chunk - 2:c0 + chunk], eos=EOS)
+                        time.sleep(min(chunk, n - c0) / a.prefill_tps)
+                        warm_done = fut.done() if fut is not None else None
+                        out.append(dict(chunk=chunk, hint=hint, name=s_["name"], c0=c0, tokens=int(x.numel() // 16),
+                                        ms=dt * 1e3, hint_done_before_next=warm_done))
+                        print(json.dumps(out[-1]), flush=True)
+                tab.release()
+        res.update(hint=out)
     elif a.mode == "qd":
         # cold random reads through the store: n ids per resolve, fresh rows each time
         out = []

@@ -264,6 +264,8 @@ public:
     }
 
     void set_warm_chunk(int64_t c) { warm_chunk_ = std::max<int64_t>(16, c); }
+    // dry run: cache bookkeeping only, no reads (hit-rate simulation on large corpora)
+    void set_dry(bool d) { dry_ = d; }
 
     // copy the raw bytes of the rows behind slots (verification)
     void read_slots(torch::Tensor slots, torch::Tensor out)
@@ -399,7 +401,7 @@ private:
         }
         double t1 = now_us();
         int64_t runs = 0, bytes = 0, blocks = 0;
-        if (!misses_.empty()) read_misses(runs, bytes, blocks);
+        if (!misses_.empty() && !dry_) read_misses(runs, bytes, blocks);
         double t2 = now_us();
         if (!service)
         {
@@ -620,6 +622,7 @@ private:
     int backend_, threads_, qd_;
     int64_t max_run_, merge_gap_, cap_;
     int64_t warm_chunk_ = 1024;
+    bool dry_ = false;
     std::vector<Extent> ext_;
     int64_t num_rows_ = 0;
     int fd_ = -1;
@@ -763,6 +766,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("resolve", &RowStore::resolve_tensor, py::call_guard<py::gil_scoped_release>())
         .def("warm", &RowStore::warm_tensor, py::call_guard<py::gil_scoped_release>())
         .def("set_warm_chunk", &RowStore::set_warm_chunk)
+        .def("set_dry", &RowStore::set_dry)
         .def("read_slots", &RowStore::read_slots)
         .def("start_service", &RowStore::start_service)
         .def("stop_service", &RowStore::stop_service, py::call_guard<py::gil_scoped_release>())
