@@ -33,6 +33,7 @@ _PACKED = {
     "in_proj_ba": ["in_proj_b", "in_proj_a"],
 }
 TARGET_LM_HEADS: list = []
+_SYNC_LOGITS = os.environ.get("EXL3_SYNC_LOGITS", "0") == "1"   # debug: torch.xpu.synchronize() after lm_head (eager only)
 _MEM_TRACE = int(os.environ.get("EXL3_MEM_TRACE", "0"))      # log torch XPU memory every N target lm_head calls
 _mem_n = [0, 0]
 
@@ -351,6 +352,8 @@ def _build_classes():
             y = torch.ops.exl3xpu_C.linear(x, layer.exl3_trellis, layer.exl3_suh, layer.exl3_svh,
                                            layer.exl3_shard_of_nb, layer.exl3_bounds, layer.exl3_K, layer.exl3_cb,
                                            ops.SMALL_M_MAX, ops.RECON_SLICE_N)
+            if _SYNC_LOGITS and self.prefix.endswith("lm_head") and not torch.xpu.is_current_stream_capturing():
+                torch.xpu.synchronize()          # spike hunt: host-wait on every queue right after the logits
             if _MEM_TRACE and self.prefix.endswith("lm_head") and not torch.xpu.is_current_stream_capturing():
                 _mem_trace(x.shape[0])
             return y if bias is None else y + bias
