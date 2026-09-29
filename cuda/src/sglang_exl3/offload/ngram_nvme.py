@@ -21,7 +21,8 @@ Env (read at construction):
   SGLANG_EXL3_NGRAM_MAX_TOKENS  largest forward (tokens) one lookup may carry (default 32768 -> 524,288 ids)
   SGLANG_EXL3_NGRAM_MAX_RUN     largest coalesced read in bytes (default 65536)
   SGLANG_EXL3_NGRAM_MERGE_GAP   merge two runs if the gap is <= this many bytes (default 0: touching blocks only)
-  SGLANG_EXL3_NGRAM_SPIN_US     service thread busy-polls this long after the last request, then sleeps 20 us (200000)
+  SGLANG_EXL3_NGRAM_SPIN_US     service thread busy-polls this long after the last request, then polls with 20 us sleeps
+                                (default 0: N009 measured fewer outliers and no burned core; +4 us/step when overlapped)
   SGLANG_EXL3_NGRAM_TIMEOUT_S   GPU wait timeout (default 60): on expiry the step continues with stale rows, error set
 """
 from __future__ import annotations
@@ -142,7 +143,7 @@ class Exl3NgramNvmeTable(torch.nn.Module):
             dev = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
             self._attach(dev, aux["head_bias"])
         if start_service and self.device is not None:
-            self.store.start_service(_env("SGLANG_EXL3_NGRAM_SPIN_US", 200000, int))
+            self.store.start_service(_env("SGLANG_EXL3_NGRAM_SPIN_US", 0, int))
         logger.info("EXL3 n-gram table on NVMe (%s): %d rows x %d B, RAM row cache %.2f GB = %d slots, max %d ids/lookup, "
                     "init %.1f s", io, self.num_rows, self.row_bytes, self.ram_gb, nslots, self.cap, time.time() - t0)
 
