@@ -131,10 +131,16 @@ class Exl3Config(QuantizationConfig):
             experts = {k: v for k, v in self.modules.items() if _expert_of(k, prefix)}
             if not experts:
                 return None
-            if os.environ.get("SGLANG_EXL3_MOE_OFFLOAD", "") == "cpu":
+            mode = os.environ.get("SGLANG_EXL3_MOE_OFFLOAD", "")
+            if mode == "cpu":
                 # routed experts on exllamav3's CPU worker (host RAM tier), graph-safe decode handoff
                 from ..offload.cpu_moe import Exl3CpuMoEMethod
                 return Exl3CpuMoEMethod(self, prefix, experts)
+            # SGLANG_EXL3_MOE_OFFLOAD=gpu_cache (or 1): main-model routed experts in pinned host memory + global GPU
+            # expert cache (kernel lane K05)
+            if mode in ("1", "gpu_cache") and not prefix.startswith("mtp"):
+                from .offload_moe_method import Exl3OffloadMoEMethod
+                return Exl3OffloadMoEMethod(self, prefix, experts)
             from .moe import Exl3MoEMethod
             return Exl3MoEMethod(self, prefix, experts)
         if isinstance(layer, ParallelLMHead):

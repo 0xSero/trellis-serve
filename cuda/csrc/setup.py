@@ -41,6 +41,7 @@ nvcc = ["-lineinfo", "-O3", "--use_fast_math", "-std=c++17", "-static-global-tem
         "-DTRELLIS_WRAP_LOAD=" + os.environ.get("TRELLIS_WRAP_LOAD", "1"),
         "-DTRELLIS_PROBES=" + os.environ.get("TRELLIS_PROBES", "0"),
         "-DTRELLIS_SLOT_REDUCE=" + os.environ.get("TRELLIS_SLOT_REDUCE", "1"),
+        "-DTRELLIS_SPINFREE_M8=" + os.environ.get("TRELLIS_SPINFREE_M8", "1"),
         "-DTRELLIS_MOE_MINBLOCKS_M8=" + os.environ.get("TRELLIS_MOE_MINBLOCKS_M8", "2"),
         "-DTRELLIS_MCG_SELFADD=" + os.environ.get("TRELLIS_MCG_SELFADD", "1"),
         "-DTRELLIS_K3_IMAD_SHIFTS=" + os.environ.get("TRELLIS_K3_IMAD_SHIFTS", "0")]

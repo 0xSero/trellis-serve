@@ -60,6 +60,10 @@
 #ifndef TRELLIS_MOE_MINBLOCKS_M8
   #define TRELLIS_MOE_MINBLOCKS_M8 2  // __launch_bounds__ min blocks per SM for the 8-row (decode) family: 2 = 128 registers (no spills), two co-resident blocks
 #endif
+#ifndef TRELLIS_SPINFREE_M8
+  #define TRELLIS_SPINFREE_M8 1  // 8-row (decode) family: last-ARRIVER slot reduce, no block ever waits for another (safe
+                                 // next to a concurrent Marlin-template launch on another stream); bit-identical results
+#endif
 #ifndef TRELLIS_SLOT_REDUCE
   #define TRELLIS_SLOT_REDUCE 1  // cross-block reduce: 1 per-block slots for the 8-row family, 2 also 16-row, 0 Marlin's chain
 #endif
@@ -2316,6 +2320,41 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
 
       thread_block_reduce();
 
+      // EXL3: spin-free slot reduce for the 8-row family (TRELLIS_SPINFREE_M8). Every block of a multi-block slice
+      // stores its fp32 partial (non-designated blocks: region A = blockIdx.x; the designated top block: region B =
+      // gridDim.x + blockIdx.x, so its other slice's partial in region A is never overwritten), then takes a ticket
+      // with an acq_rel atomic on the slice lock. The block that arrives LAST (whichever it is) sums the partials in the
+      // fixed order of the waiting scheme (designated partial first, then c = slice_count - 1 .. 1, starting from -0.0
+      // so the first add is an exact copy) and runs the epilogue; the others move on. No block ever waits.
+      bool trellis_reduced = false;
+  #if TRELLIS_SPINFREE_M8
+      if constexpr (m_block_size_8 && TRELLIS_SLOT_REDUCE >= 1) {
+        if (slice_count > 1 && !use_atomic_add) {
+          const bool designated = slice_idx == slice_count - 1;
+          const int d = blockIdx.x - (slice_count - 1 - slice_idx);
+          global_reduce_fp32(true, false, designated ? (int)gridDim.x + (int)blockIdx.x : (int)blockIdx.x);
+          // (the ticket is broadcast with __syncthreads_or, NOT a __shared__ variable: any static shared memory pushes
+          // the launch over the 2-blocks-per-SM budget the launcher sizes dynamic smem to -> half the blocks resident,
+          // half the in-flight zero-copy reads; measured 2.1x slower host-resident decode)
+          __syncthreads();
+          int ticket = -1;
+          if (threadIdx.x == 0)
+            asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;\n" : "=r"(ticket) : "l"(&locks[locks_off]) : "memory");
+          last = __syncthreads_or(threadIdx.x == 0 && ticket == slice_count - 1) != 0;
+          if (last) {
+            float* fc = reinterpret_cast<float*>(&frag_c);
+    #pragma unroll
+            for (int i = 0; i < (int)(sizeof(frag_c) / sizeof(float)); i++) fc[i] = -0.0f;
+            global_reduce_fp32(false, true, (int)gridDim.x + d);
+            for (int c = slice_count - 1; c >= 1; c--) global_reduce_fp32(false, true, d + c);
+            __syncthreads();
+            if (threadIdx.x == 0) locks[locks_off] = 0;
+          }
+          trellis_reduced = true;
+        }
+      }
+  #endif
+
       if (has_bias && last) {
         __syncthreads();
         cp_async4_pred(&sh_bias[bias_sh_wr], &b_bias_ptr[bias_gl_rd],
@@ -2408,7 +2447,7 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
         }
       }
 
-      if (slice_count > 1 && !use_atomic_add) {
+      if (slice_count > 1 && !use_atomic_add && !trellis_reduced) {
         // only globally reduce if there is more than one block in a slice
         // EXL3: Marlin reduces a shared column slice through a serial chain (block i waits for block i-1, reads
         // its running sum, adds, writes). Slot reduce (ported from the dense kernel): every
