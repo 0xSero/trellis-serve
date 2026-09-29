@@ -89,6 +89,14 @@ def _make_pool_class():
                         bits, m, self.layer_num, sum(t.numel() * t.element_size() for t in
                         self.k_buffer + self.v_buffer + self.k_scale_buffer + self.v_scale_buffer) / 1e9)
 
+        def _init_kv_copy_and_warmup(self):
+            # KV row copies (speculative decoding with topk > 1) are not implemented for packed rows; topk = 1
+            # (NEXTN/EAGLE chains) never moves KV rows
+            self._kv_copy_config = None
+
+        def move_kv_cache(self, *a, **k):
+            raise NotImplementedError("Exl3QKVPool: KV row moves (speculative topk > 1) are not supported")
+
         def _get_key_buffer(self, layer_id):
             l = layer_id - self.start_layer
             return QKVView(self.k_buffer[l], self.k_scale_buffer[l], self.head_dim)
