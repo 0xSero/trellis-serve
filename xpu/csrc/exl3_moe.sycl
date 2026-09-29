@@ -1299,6 +1299,107 @@ void ngram_gather_dequant(at::Tensor ids, at::Tensor chunk_ptrs, int64_t rows_pe
     });
 }
 
+
+// ------------------------------------------------------------------------------------------------
+// QSA decode block selection (Qwen3.8-Flash-Next indexer), fused and bounded by the real context:
+//   score[j] = sum_h relu(q[h] . k_j) for compressed keys j < length[b] (k_j = cache[page_table[b][j / ps]][j % ps][0])
+//   out[b] = indices of the top-`topk` scores (any order), -1 padded
+// SGLang's torch fallback scores and top-ks the whole graph-sized page table (65,536 keys at 262k context) every step.
+// One work-group (1024) per row: scores -> scratch, exact top-k by radix select on order-preserving float keys.
+template <typename T>
+static void qsa_select_impl(sycl::queue& q, const T* qv, int H, int D, const T* cache, int ps, const int* pt, int maxp,
+                            const int* lens, float* scratch, int maxlen, int* out, int topk, int B) {
+    constexpr int WG = 1024;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>(H * D), h);
+        sycl::local_accessor<int, 1> hist(sycl::range<1>(256), h), sc(sycl::range<1>(8), h);
+        h.parallel_for(sycl::nd_range<1>((size_t)B * WG, WG), [=](sycl::nd_item<1> it) {
+            int b = it.get_group(0), l = it.get_local_id(0);
+            auto g = it.get_group();
+            using lref = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                          sycl::access::address_space::local_space>;
+            for (int i = l; i < H * D; i += WG) qs[i] = (float)qv[(size_t)b * H * D + i];
+            if (l < 8) sc[l] = 0;
+            sycl::group_barrier(g);
+            int len = sycl::min(lens[b], sycl::min(maxlen, maxp * ps));
+            float* s = scratch + (size_t)b * maxlen;
+            int* o = out + (size_t)b * topk;
+            if (len <= topk) {                                   // everything is selected
+                for (int j = l; j < topk; j += WG) o[j] = j < len ? j : -1;
+                return;
+            }
+            for (int j = l; j < len; j += WG) {
+                const T* k = cache + ((size_t)pt[(size_t)b * maxp + j / ps] * ps + j % ps) * D;
+                float acc = 0.0f;
+                for (int hh = 0; hh < H; ++hh) {
+                    float d = 0.0f;
+                    for (int x = 0; x < D; ++x) d += qs[hh * D + x] * (float)k[x];
+                    acc += sycl::fmax(d, 0.0f);
+                }
+                s[j] = acc;
+            }
+            sycl::group_barrier(g, sycl::memory_scope::work_group);
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
+            // radix select of the topk-th largest: descending order key u = ~orderable(bits)
+            auto ukey = [](float f) -> uint32_t {
+                uint32_t bits = sycl::bit_cast<uint32_t>(f);
+                uint32_t ord = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);   // ascending with f
+                return ~ord;                                                              // ascending = descending f
+            };
+            uint32_t prefix = 0; int want = topk;
+            for (int shift = 24; shift >= 0; shift -= 8) {
+                if (l < 256) hist[l] = 0;
+                sycl::group_barrier(g);
+                uint32_t hmask = shift == 24 ? 0u : (0xFFFFFFFFu << (shift + 8));
+                for (int j = l; j < len; j += WG) {
+                    uint32_t u = ukey(s[j]);
+                    if ((u & hmask) == (prefix & hmask)) lref(hist[(u >> shift) & 255]).fetch_add(1);
+                }
+                sycl::group_barrier(g);
+                int c = l < 256 ? hist[l] : 0;
+                int cum = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());
+                if (l < 256 && cum < want && want <= cum + c) { sc[4] = l; sc[5] = want - cum; }
+                sycl::group_barrier(g);
+                prefix |= (uint32_t)sc[4] << shift;
+                want = sc[5];
+                sycl::group_barrier(g);
+            }
+            for (int j = l; j < len; j += WG) {
+                uint32_t u = ukey(s[j]);
+                if (u < prefix) o[lref(sc[0]).fetch_add(1)] = j;
+            }
+            sycl::group_barrier(g);
+            int nlt = sc[0];                                   // == topk - want
+            for (int j = l; j < len; j += WG) {
+                uint32_t u = ukey(s[j]);
+                if (u == prefix) {
+                    int k2 = lref(sc[1]).fetch_add(1);
+                    if (k2 < want) o[nlt + k2] = j;
+                }
+            }
+        });
+    });
+}
+
+void qsa_decode_select(at::Tensor qv, at::Tensor cache, at::Tensor page_table, at::Tensor lengths, at::Tensor scratch,
+                       at::Tensor out, int64_t topk) {
+    TORCH_CHECK(qv.is_contiguous() && cache.is_contiguous() && page_table.is_contiguous() && out.is_contiguous());
+    TORCH_CHECK(page_table.scalar_type() == at::kInt && lengths.scalar_type() == at::kInt && out.scalar_type() == at::kInt);
+    TORCH_CHECK(qv.scalar_type() == cache.scalar_type(), "q / cache dtype");
+    int B = qv.size(0), H = qv.size(1), D = qv.size(2);
+    int ps = cache.size(1), maxp = page_table.size(1), maxlen = scratch.size(1);
+    auto& q = queue_of(qv);
+    if (qv.scalar_type() == at::kBFloat16)
+        qsa_select_impl<bf16>(q, reinterpret_cast<const bf16*>(qv.data_ptr()), H, D, reinterpret_cast<const bf16*>(cache.data_ptr()),
+                              ps, page_table.data_ptr<int>(), maxp, lengths.data_ptr<int>(), scratch.data_ptr<float>(), maxlen,
+                              out.data_ptr<int>(), (int)topk, B);
+    else if (qv.scalar_type() == at::kHalf)
+        qsa_select_impl<sycl::half>(q, reinterpret_cast<const sycl::half*>(qv.data_ptr()), H, D,
+                                    reinterpret_cast<const sycl::half*>(cache.data_ptr()), ps, page_table.data_ptr<int>(), maxp,
+                                    lengths.data_ptr<int>(), scratch.data_ptr<float>(), maxlen, out.data_ptr<int>(), (int)topk, B);
+    else TORCH_CHECK(false, "qsa_decode_select: bf16 / fp16 only");
+}
+
 // ------------------------------------------------------------------------------------------------
 // Host USM: sycl::malloc_host in torch's XPU context, returned as a CPU uint8 tensor (device-readable, zero-copy).
 at::Tensor host_alloc(int64_t nbytes) {
@@ -1351,6 +1452,8 @@ TORCH_LIBRARY(exl3xpu_moe, m) {
     m.def("usm_kind(int ptr) -> int", &moe::usm_kind);
     m.def("memcpy_async(int dst, int src, int nbytes) -> ()", &moe::memcpy_async);
     m.def("blob_bytes(int H, int I, int K) -> int", &moe::blob_bytes);
+    m.def("qsa_decode_select(Tensor q, Tensor cache, Tensor page_table, Tensor lengths, Tensor(a!) scratch, Tensor(b!) out, int topk) -> ()");
+    m.impl("qsa_decode_select", torch::kXPU, &moe::qsa_decode_select);
     m.def("ngram_gather_dequant(Tensor ids, Tensor chunk_ptrs, int rows_per_chunk, int num_rows, int words, int K, Tensor head_bias, Tensor(a!) out) -> ()");
     m.impl("ngram_gather_dequant", torch::kXPU, &moe::ngram_gather_dequant);
     m.def("moe_set_splits(int gu_p, int dn_p) -> ()", &moe::moe_set_splits);

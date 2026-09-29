@@ -196,6 +196,33 @@ def install() -> None:
                     logger.info("exl3xpu: QSA %s.forward_extend uses the Triton sparse-GQA kernels on XPU", name)
         except Exception as e:  # pragma: no cover
             logger.warning("exl3xpu: QSA Triton extend patch failed (%s)", e)
+    if os.environ.get("EXL3_QSA_DECODE_SELECT", "1") == "1":
+        # decode block selection: fused SYCL kernel bounded by the real context (the torch fallback scores and top-ks
+        # the whole graph-sized page table, 65,536 compressed keys, every step)
+        try:
+            qi = importlib.import_module("sglang.srt.layers.attention.qsa.qsa_indexer")
+            from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
+            from .moe_offload import ops as _ops
+            cls = qi.QSAIndexer
+            orig_sel = cls.select_decode_tokens
+
+            def select_decode_tokens(self, q, compressed_cache, compressed_page_table, compressed_lengths,
+                                     max_model_len, query_positions, sequence_lengths):
+                if q.dtype not in (torch.bfloat16, torch.float16) or compressed_cache.dtype != q.dtype:
+                    return orig_sel(self, q, compressed_cache, compressed_page_table, compressed_lengths,
+                                    max_model_len, query_positions, sequence_lengths)
+                B = q.shape[0]
+                scratch = torch.empty((B, int(max_model_len)), dtype=torch.float32, device=q.device)
+                out = torch.empty((B, self.block_topk), dtype=torch.int32, device=q.device)
+                _ops().qsa_decode_select(q.contiguous(), compressed_cache.contiguous(),
+                                         compressed_page_table.to(torch.int32).contiguous(),
+                                         compressed_lengths.to(torch.int32).contiguous(), scratch, out, self.block_topk)
+                return expand_qsa_block_indices(out, query_positions, sequence_lengths,
+                                                compress_ratio=self.compress_ratio, token_topk=self.token_topk)
+            cls.select_decode_tokens = select_decode_tokens
+            logger.info("exl3xpu: QSA decode block selection: fused SYCL kernel")
+        except Exception as e:  # pragma: no cover
+            logger.warning("exl3xpu: QSA decode select patch failed (%s)", e)
     # Graph replay on non-CUDA devices: the backend's torch path maps logical -> physical KV slots through
     # metadata.token_slot_table, which in graph mode is a DUMMY buffer (_graph_dummy_token_slot_table, only the CUDA
     # kernels are fed through the graph page tables) and is never refreshed at replay -> full-attention layers read

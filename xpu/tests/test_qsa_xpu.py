@@ -33,4 +33,21 @@ for R in (7, 300):
     e2 = ((a.float() - c.float()).abs().max() / a.float().abs().max()).item()
     print("union attn R", R, "rel max err", e2, "empty row zero:", c[3].abs().max().item() == 0)
     bad += e2 > 2e-2
+# fused decode selection vs torch MQA decode + top-k (same selected sets)
+from sglang.srt.layers.attention.qsa import mqa as MQ
+from exl3xpu.moe_offload import ops
+X = ops()
+for L_, pages in ((100, 1024), (3000, 1024), (60000, 1024)):
+    ps = 64
+    cache = torch.randn(pages + 8, ps, 1, 128, device=dev).to(torch.bfloat16)
+    pt = torch.randperm(pages, device=dev)[:pages].to(torch.int32).view(1, -1)
+    lens = torch.tensor([L_], device=dev, dtype=torch.int32)
+    qd = torch.zeros(1, 8, 128, device=dev, dtype=torch.bfloat16); qd[:, :4] = torch.randn(1, 4, 128, device=dev)
+    lg = MQ.torch_qsa_mqa_decode(qd, cache, pt, lens, pages * ps)
+    a = qsa_xpu.qsa_fast_topk(lg, torch.zeros_like(lens), lens, 512)
+    scratch = torch.empty(1, pages * ps, device=dev); o = torch.empty(1, 512, dtype=torch.int32, device=dev)
+    X.qsa_decode_select(qd, cache, pt, lens, scratch, o, 512)
+    sa, so = set(a[0][a[0] >= 0].tolist()), set(o[0][o[0] >= 0].tolist())
+    print("decode select len", L_, "same set:", sa == so, len(sa), len(so), "sym diff", len(sa ^ so))
+    bad += len(sa ^ so) > 2          # bf16 score ties at the boundary may swap one entry
 sys.exit(bad)
