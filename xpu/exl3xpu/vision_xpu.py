@@ -31,6 +31,7 @@ import torch
 logger = logging.getLogger(__name__)
 _PENDING_QC: list = []
 _TOK: dict = {}
+_LOGN = [0]
 _QKV_RE = re.compile(r"visual\.blocks\.(\d+)\.attn\.(q|k|v)_proj\.(\w+)$")
 _FUSED_QKV_RE = re.compile(r"visual\.blocks\.\d+\.attn\.qkv\.(weight|bias)$")
 
@@ -119,6 +120,83 @@ def install() -> None:
 
     V.__init__, V._exl3_patched = vis_init, True
 
+    rows = int(os.environ.get("EXL3_VIT_ROWS", "8192"))
+    if rows > 0:
+        # Row-chunked ViT block (same math as Qwen3_VisionBlock + VisionAttention, per-row ops chunked): the peak is
+        # x + q/k/v [S, H, D] + one row chunk of transients instead of ~3 full-width copies of qkv and fc1 per call
+        # (a 4096^2 image is 65,536 patches; fc1 alone is 0.57 GB per bf16 copy at that size).
+        from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager as rope
+        B = q3.Qwen3_VisionBlock
+        b_fwd = B.forward
+
+        def block_forward(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, *a, **k):
+            attn = self.attn
+            if not hasattr(attn.qkv_proj, "exl3_trellis") or not attn.use_qkv_parallel or x.shape[1] != 1:
+                return b_fwd(self, x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, *a, **k)
+            S = x.shape[0]
+            x2 = x.view(S, -1)
+            H, Dh = attn.num_attention_heads_per_partition, attn.head_size
+            cos, sin = rotary_pos_emb_cos, rotary_pos_emb_sin
+            if cos.size(-1) * 2 == Dh:
+                cos, sin = torch.cat([cos, cos], dim=-1), torch.cat([sin, sin], dim=-1)
+            q = torch.empty(S, H, Dh, dtype=x.dtype, device=x.device)
+            kk = torch.empty_like(q)
+            vv = torch.empty_like(q)
+            for r0 in range(0, S, rows):
+                r1 = min(S, r0 + rows)
+                qkv, _ = attn.qkv_proj(self.norm1(x2[r0:r1]))
+                qc, kc, vc = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+                qc, kc = rope(qc.reshape(-1, H, Dh), kc.reshape(-1, H, Dh), cos[r0:r1], sin[r0:r1])
+                q[r0:r1], kk[r0:r1], vv[r0:r1] = qc, kc, vc.reshape(-1, H, Dh)
+                del qkv, qc, kc, vc
+            o = attn.qkv_backend.forward(q=q, k=kk, v=vv, bsz=1, seq_len=S, cu_seqlens=cu_seqlens,
+                                         softmax_scale=attn.softmax_scale)
+            del q, kk, vv
+            for r0 in range(0, S, rows):
+                r1 = min(S, r0 + rows)
+                out, _ = attn.proj(o[r0:r1].reshape(r1 - r0, H * Dh))
+                x2[r0:r1] += out
+            del o
+            for r0 in range(0, S, rows):
+                r1 = min(S, r0 + rows)
+                x2[r0:r1] += self.mlp(self.norm2(x2[r0:r1]))
+            return x
+
+        B.forward = block_forward
+
+    if os.environ.get("EXL3_VIT_EMPTY_CACHE", "1") == "1":
+        # the ViT's transients (activations of up to 65,536 patches) must not stay in torch's cache: the Level Zero
+        # driver needs that headroom for its own allocations (X004: OUT_OF_RESOURCES when torch's cache grows into it)
+        v_fwd0 = V.forward
+
+        def vis_forward_ec(self, *a, **k):
+            out = v_fwd0(self, *a, **k)
+            torch.xpu.empty_cache()
+            return out
+
+        V.forward = vis_forward_ec
+
+    if os.environ.get("EXL3_VIT_LOG", "0") == "1":
+        # per ViT call: grid, patches, wall ms (host-synchronised) and peak torch allocation above the entry level
+        import time
+        v_fwd = V.forward
+
+        def vis_forward(self, x, grid_thw, *a, **k):
+            torch.xpu.synchronize()
+            base = torch.xpu.memory_allocated()
+            torch.xpu.reset_peak_memory_stats()
+            t0 = time.perf_counter()
+            out = v_fwd(self, x, grid_thw, *a, **k)
+            torch.xpu.synchronize()
+            g = grid_thw.tolist() if isinstance(grid_thw, torch.Tensor) else grid_thw
+            logger.info("exl3xpu vit: grid %s patches %d -> %s, %.1f ms, peak +%.3f GiB above %.3f GiB, device free "
+                        "%.2f GiB", g, x.shape[0], tuple(out.shape), (time.perf_counter() - t0) * 1e3,
+                        (torch.xpu.max_memory_allocated() - base) / 2 ** 30, base / 2 ** 30,
+                        torch.xpu.mem_get_info()[0] / 2 ** 30)
+            return out
+
+        V.forward = vis_forward
+
     M = q4.Qwen4ExpForConditionalGeneration
     m_init, m_load = M.__init__, M.load_weights
 
@@ -159,13 +237,14 @@ def install() -> None:
 
     M.__init__, M.load_weights = model_init, load_weights
 
-    L = q4.Qwen4ExpVLModel
-    l_fwd = L.forward
+    # SGLang's mm routine clamps the pad values in input_ids to vocab-1 IN PLACE and clears forward_batch.mm_inputs
+    # before the language model runs, so the remap happens in the outer forward (pads still intact) and the language
+    # model picks the remapped copy up for the PLE hash.
+    m_fwd = M.forward
 
-    def vl_forward(self, input_ids, positions, forward_batch, input_embeds=None, *a, **k):
+    def mm_forward(self, input_ids, positions, forward_batch, *a, **k):
         mm = getattr(forward_batch, "mm_inputs", None)
-        if mm and any(x is not None for x in mm):
-            ids = input_ids if input_ids is not None else forward_batch.input_ids
+        if mm and any(x is not None for x in mm) and input_ids is not None:
             pairs = []
             for x in mm:
                 for it in (getattr(x, "mm_items", None) or []) if x is not None else []:
@@ -174,10 +253,26 @@ def install() -> None:
                     if tid is not None and getattr(it, "pad_value", None) is not None:
                         pairs.append((int(it.pad_value), int(tid)))
             if pairs:
-                ids = ids.clone()
+                ids = input_ids.clone()
                 for pv, tid in pairs:
-                    ids.masked_fill_(ids == pv, tid)
-                input_ids = ids
+                    ids.masked_fill_(input_ids == pv, tid)
+                forward_batch._exl3_ple_ids = ids
+                if _LOGN[0] < 3:
+                    _LOGN[0] += 1
+                    logger.info("exl3xpu vision: PLE ids: %d placeholder positions -> image/video token ids (%s)",
+                                int((ids != input_ids).sum()), pairs)
+        return m_fwd(self, input_ids, positions, forward_batch, *a, **k)
+
+    M.forward = mm_forward
+
+    L = q4.Qwen4ExpVLModel
+    l_fwd = L.forward
+
+    def vl_forward(self, input_ids, positions, forward_batch, input_embeds=None, *a, **k):
+        ids = getattr(forward_batch, "_exl3_ple_ids", None)
+        if ids is not None:
+            forward_batch._exl3_ple_ids = None
+            input_ids = ids
         return l_fwd(self, input_ids, positions, forward_batch, input_embeds, *a, **k)
 
     L.forward = vl_forward
