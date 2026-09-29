@@ -27,6 +27,8 @@ def activate() -> None:
     _patch_dflash_exl3_draft()
     if os.environ.get("SGLANG_EXL3_EMBED_HOST", "0") == "1":
         _patch_host_embedding()
+    from .sglang_glue import qsa_sm86
+    qsa_sm86.install()                       # QSA decode attention without FA2/FA4 on sm_86
     if os.environ.get("SGLANG_EXL3_NGRAM_HOST", "1") == "1":
         # Qwen3.8-Flash-Next EXL3 n-gram table: pinned host memory + zero-copy gather/decode (offload/ngram_host.py);
         # a no-op for checkpoints without ngram_embedding.safetensors

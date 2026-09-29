@@ -153,13 +153,28 @@ class Exl3NgramHostTable(torch.nn.Module):
         except Exception:
             pass
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+    # Qwen4ExpPinnedHostEmbedding interface (SGLang's PLE prefetch path, config.ple_offload_embedding): the gather runs
+    # on the PLE prefetch stream while the preceding decoder layer computes
+    def allocate_output(self, shape, device) -> torch.Tensor:
+        with torch.inference_mode(False):
+            return torch.empty(shape, dtype=torch.bfloat16, device=device)
+
+    def gather(self, ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         if ids.shape[-1] != self.num_heads:
             raise ValueError(f"n-gram lookup expects [..., {self.num_heads}] ids, got {tuple(ids.shape)}")
         flat = ids.reshape(-1).to(torch.long).contiguous()
-        out = torch.empty((flat.numel(), 160), dtype=torch.bfloat16, device=ids.device)
+        if out is None:
+            out = torch.empty((*ids.shape, 160), dtype=torch.bfloat16, device=ids.device)
+        if out.dtype != torch.bfloat16 or not out.is_contiguous() or out.numel() != flat.numel() * 160:
+            raise ValueError(f"n-gram gather output {tuple(out.shape)} {out.dtype} does not fit {tuple(ids.shape)} ids")
         self._ext.ngram_gather_dequant(flat, self.dev_ptr, self.num_rows, self.words, self.K, self.head_bias, out)
-        return out.view(*ids.shape, 160)
+        return out
+
+    def reduce(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.gather(ids).view(*ids.shape, 160)
 
 
 def get_table(model_path: str) -> Exl3NgramHostTable:
@@ -214,3 +229,16 @@ def install() -> None:
 
     cls.__init__ = __init__
     cls._exl3_patched = True
+
+    # With config.ple_offload_embedding SGLang wraps the table in Qwen4ExpPinnedHostEmbedding (bf16/fp8 host copy);
+    # ours already lives in host memory and implements the same gather/allocate_output/reduce interface: pass through.
+    base = q.Qwen4ExpPinnedHostEmbedding
+
+    class Qwen4ExpPinnedHostEmbeddingExl3(base):
+        def __new__(klass, embedding, *a, **k):
+            if isinstance(embedding, Exl3NgramHostTable):
+                return embedding
+            obj = base.__new__(base)
+            obj.__init__(embedding, *a, **k)
+            return obj
+    q.Qwen4ExpPinnedHostEmbedding = Qwen4ExpPinnedHostEmbeddingExl3
