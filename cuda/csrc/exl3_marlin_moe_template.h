@@ -364,7 +364,12 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
   static_assert(a_type_id == vllm::kFloat16.id() && c_type_id == vllm::kFloat16.id() &&
                 (b_type_id == vllm::kU4B8.id() || b_type_id == vllm::kU8B128.id() ||
                  b_type_id == vllm::ScalarType::uint(3, 0).id()) && group_blocks == -1 &&
-                !is_zp_float && ((exl3_cb >= 0 && exl3_cb <= 2) || exl3_cb == TRELLIS_CB_MCG_LUT));
+                !is_zp_float && ((exl3_cb >= 0 && exl3_cb <= 2) || exl3_cb == 11 || exl3_cb == 12 ||
+                                 exl3_cb == TRELLIS_CB_MCG_LUT));
+  // EXL3 K08: cb 11 / 12 = MCG / MUL1 with fp16 ACCUMULATION in the tensor-core MMA (2x the GeForce fp32-accumulate
+  // rate; partial sums converted to fp32 before the cross-block reduction). Prefill families only (setup.py).
+  constexpr bool exl3_acc16 = exl3_cb == 11 || exl3_cb == 12;
+  constexpr int exl3_cbd = exl3_acc16 ? exl3_cb - 10 : exl3_cb;   // codebook used for decoding
   constexpr bool exl3_k6 = b_type_id == vllm::kU8B128.id();
   // EXL3: K = 3 experts: tiles staged byte-exact (24 words each, [E, k/16, n/64, 4, 24]); every
   // lane gathers two words per n-tile from shared memory at lane-constant offsets and decodes with dq8_regs_3bits.
@@ -381,7 +386,7 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
       (!(b_type_id == vllm::kFE2M1f.id() && s_type_id == vllm::kFE4M3fn.id()) &&
        !(group_blocks == -1 && num_bits == 4));
   #else
-  constexpr bool use_fp16_accum = false;
+  constexpr bool use_fp16_accum = exl3_acc16;
   #endif
   using Adtype = MarlinScalarType<a_type_id>;
   using Cdtype = MarlinScalarType<c_type_id>;
@@ -1536,7 +1541,7 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
     // tile 0 of the next vector, which the double-buffered register load has already delivered) is decoded before
     // the current MMA is issued, so the decode chain never sits between two MMAs of the same lane.
     // (Tried before and slower: decode all four tiles first, then four MMAs.)
-    if constexpr (exl3_cb == 8 && !exl3_k6 && !exl3_k3 && !exl3_lut) {
+    if constexpr (exl3_cbd == 8 && !exl3_k6 && !exl3_k3 && !exl3_lut) {
       auto dec = [&](int kk, int jj, FragB& o0, FragB& o1) {
         uint32_t bw = (uint32_t)frag_b_quant[kk][0][jj];
   #if TRELLIS_WRAP_LOAD
@@ -1544,7 +1549,7 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
   #else
         uint32_t aw = __shfl_sync(0xffffffffu, bw, ((threadIdx.x % 32) + 31) & 31);
   #endif
-        trellis_exl3::dq8_regs_4bits<FragB, exl3_cb>(aw, bw, o0, o1);
+        trellis_exl3::dq8_regs_4bits<FragB, exl3_cbd>(aw, bw, o0, o1);
       };
       if (!pipe_dec_valid) dec(k2, 0, pipe_f0, pipe_f1);
   #pragma unroll
@@ -1580,23 +1585,23 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
       // EXL3: word j of this lane's staged vector is the lane's stream word of n-tile j; the 12 wrap
       // bits come from the previous lane of the same warp (tail-biting: lane 0 <- lane 31).
       if constexpr (exl3_k3) {
-        trellis_exl3::dq8_regs_3bits<FragB, exl3_cb>(frag_b3[k2][j][0], frag_b3[k2][j][1], k3_s2, frag_b0, frag_b1, lut_sh);
+        trellis_exl3::dq8_regs_3bits<FragB, exl3_cbd>(frag_b3[k2][j][0], frag_b3[k2][j][1], k3_s2, frag_b0, frag_b1, lut_sh);
       } else if constexpr (exl3_k6) {
         // K = 6: the lane's two staged vectors hold (hi, lo) of n-tile j at ints 2j, 2j+1; no neighbour needed.
         int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
         uint32_t hi = (uint32_t)frag_b_quant_ptr[j * 2 + 0];
         uint32_t lo = (uint32_t)frag_b_quant_ptr[j * 2 + 1];
-        trellis_exl3::dq8_regs_6bits<FragB, exl3_cb>(hi, lo, frag_b0, frag_b1);
+        trellis_exl3::dq8_regs_6bits<FragB, exl3_cbd>(hi, lo, frag_b0, frag_b1);
       } else {
         uint32_t bw = (uint32_t)frag_b_quant[k2][0][j];
         uint32_t aw;
   #if TRELLIS_WRAP_LOAD
         aw = (uint32_t)frag_b_prev[k2][j];  // the previous lane's vector, loaded from shared memory with our own
   #else
-        if constexpr (exl3_cb >= 4) aw = bw;  // timing probes 4, 5: no neighbour shuffle
+        if constexpr (exl3_cbd >= 4) aw = bw;  // timing probes 4, 5: no neighbour shuffle
         else aw = __shfl_sync(0xffffffffu, bw, ((threadIdx.x % 32) + 31) & 31);
   #endif
-        trellis_exl3::dq8_regs_4bits<FragB, exl3_cb>(aw, bw, frag_b0, frag_b1, lut_sh);
+        trellis_exl3::dq8_regs_4bits<FragB, exl3_cbd>(aw, bw, frag_b0, frag_b1, lut_sh);
       }
 
       if constexpr (dequant_skip_flop && has_zp && !is_zp_float && !is_a_8bit) {

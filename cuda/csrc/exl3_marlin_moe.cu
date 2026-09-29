@@ -391,6 +391,64 @@ void trellis_moe_glu_had_in_gs_kernel(const half* __restrict__ gu, half* __restr
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// K08 compact variants for part-wise prefill: iterate only the slots listed in an align output (sorted ids of one expert
+// part, entries < num_post that are < slots), instead of sweeping every slot of the chunk once per part. Same per-item
+// arithmetic as the grid-strided kernels above -> bit-identical rows.
+template <bool in_bf16, bool ids64>
+__global__ __launch_bounds__(256)
+void trellis_moe_had_in_compact_kernel(const half* __restrict__ x, half* __restrict__ xh, const void* __restrict__ ids,
+                                       const int* __restrict__ sorted, const int* __restrict__ npost, const int cap,
+                                       const int slots, const int top_k, const int shards, const int num_experts,
+                                       const int kb, const int64_t* __restrict__ ptrs, const int pstride) {
+  const size_t width = (size_t)kb * 128;
+  const int n = min(*npost, cap);
+  const int64_t total = (int64_t)shards * n * kb, stride = (int64_t)gridDim.x * 8;
+  for (int64_t w = (int64_t)blockIdx.x * 8 + threadIdx.x / 32; w < total; w += stride) {
+    const int blk = (int)(w % kb);
+    const int64_t rs = w / kb;
+    const int i = (int)(rs % n), shard = (int)(rs / n);
+    const int slot = sorted[i];
+    if (slot >= slots) continue;
+    int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
+    if (e < 0 || e >= num_experts) continue;
+    const half* su = reinterpret_cast<const half*>(ptrs[e * pstride]) + width * shard;
+    trellis_had_r_128_inner<in_bf16, false, true, false>(x + width * (slot / top_k) + blk * 128,
+                                                        xh + width * ((int64_t)shard * slots + slot) + blk * 128, su,
+                                                        blk * 32, kHadScale);
+  }
+}
+
+template <bool ids64>
+__global__ __launch_bounds__(256)
+void trellis_moe_glu_had_in_compact_kernel(const half* __restrict__ gu, half* __restrict__ xd, half* __restrict__ act_tmp,
+                                           const void* __restrict__ ids, const int* __restrict__ sorted,
+                                           const int* __restrict__ npost, const int cap, const int slots,
+                                           const int num_experts, const int kb, const int64_t* __restrict__ ptrs,
+                                           const int pstride) {
+  const size_t inter = (size_t)kb * 128;
+  const int n = min(*npost, cap);
+  const int64_t total = (int64_t)n * kb, stride = (int64_t)gridDim.x * 8;
+  const int t = threadIdx.x & 31;
+  for (int64_t w = (int64_t)blockIdx.x * 8 + threadIdx.x / 32; w < total; w += stride) {
+    const int blk = (int)(w % kb);
+    const int slot = sorted[w / kb];
+    if (slot >= slots) continue;
+    int64_t e = ids64 ? ((const int64_t*)ids)[slot] : (int64_t)((const int32_t*)ids)[slot];
+    if (e < 0 || e >= num_experts) continue;
+    const half4 g = ((const half4*)(gu + 2 * inter * slot + blk * 128))[t];
+    const half4 u = ((const half4*)(gu + 2 * inter * slot + inter + blk * 128))[t];
+    float2 g0 = __half22float2(g.x), g1 = __half22float2(g.y), u0 = __half22float2(u.x), u1 = __half22float2(u.y);
+    half4 a;
+    a.x = __floats2half2_rn(trellis_act_silu(g0.x) * u0.x, trellis_act_silu(g0.y) * u0.y);
+    a.y = __floats2half2_rn(trellis_act_silu(g1.x) * u1.x, trellis_act_silu(g1.y) * u1.y);
+    half* act = act_tmp + inter * slot + blk * 128;
+    ((half4*)act)[t] = a;
+    const half* su = reinterpret_cast<const half*>(ptrs[e * pstride]);
+    trellis_had_r_128_inner<false, false, true, false>(act, xd + inter * slot + blk * 128, su, blk * 32, kHadScale);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Torch entry points
 
 static bool is_16bit_float(const at::Tensor& t) { return t.dtype() == at::kHalf || t.dtype() == at::kBFloat16; }
@@ -548,6 +606,52 @@ static void check_ptrs(const at::Tensor& ptrs, int64_t field) {
   TORCH_CHECK(ptrs.is_cuda() && ptrs.dtype() == at::kLong && ptrs.dim() == 2 && ptrs.is_contiguous(),
               "ptrs must be a contiguous int64 CUDA tensor [E, F]");
   TORCH_CHECK(field >= 0 && field < ptrs.size(1), "pointer-table field out of range");
+}
+
+// K08: xh rows (both slabs) of only the slots listed in sorted[0 : min(*npost, cap)) (entries >= slots = padding)
+void moe_had_in_ptr_compact(const at::Tensor& x, const at::Tensor& ptrs, int64_t field, const at::Tensor& ids,
+                            const at::Tensor& sorted, const at::Tensor& npost, at::Tensor& xh) {
+  const at::cuda::OptionalCUDAGuard device_guard(x.device());
+  check_ptrs(ptrs, field);
+  TORCH_CHECK(x.dim() == 2 && is_16bit_float(x) && x.is_contiguous() && x.size(1) % 128 == 0);
+  TORCH_CHECK(ids.dim() == 2 && is_index(ids) && ids.is_contiguous() && ids.size(0) == x.size(0));
+  TORCH_CHECK(sorted.dtype() == at::kInt && npost.dtype() == at::kInt && npost.numel() == 1);
+  const int64_t k = x.size(1), slots = ids.numel(), cap = sorted.numel();
+  TORCH_CHECK(xh.dtype() == at::kHalf && xh.is_contiguous() && xh.numel() >= 2 * slots * k);
+  if (slots == 0) return;
+  const int kb = (int)(k / 128);
+  const int gb = (int)std::min<int64_t>(8448, (2 * cap * kb + 7) / 8);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  const bool bf = x.dtype() == at::kBFloat16, i64 = ids.dtype() == at::kLong;
+  const half* xp = (const half*)x.data_ptr(); half* op = (half*)xh.data_ptr();
+  const int64_t* tp = ptrs.data_ptr<int64_t>() + field; const int ps = (int)ptrs.size(1);
+  const int* sp = sorted.data_ptr<int>(); const int* np = npost.data_ptr<int>();
+  const int ne = (int)ptrs.size(0), tk = (int)ids.size(1);
+  // clang-format off
+  if (bf && i64)  trellis_moe_had_in_compact_kernel<true, true><<<gb, 256, 0, stream>>>(xp, op, ids.data_ptr(), sp, np, (int)cap, (int)slots, tk, 2, ne, kb, tp, ps);
+  else if (bf)    trellis_moe_had_in_compact_kernel<true, false><<<gb, 256, 0, stream>>>(xp, op, ids.data_ptr(), sp, np, (int)cap, (int)slots, tk, 2, ne, kb, tp, ps);
+  else if (i64)   trellis_moe_had_in_compact_kernel<false, true><<<gb, 256, 0, stream>>>(xp, op, ids.data_ptr(), sp, np, (int)cap, (int)slots, tk, 2, ne, kb, tp, ps);
+  else            trellis_moe_had_in_compact_kernel<false, false><<<gb, 256, 0, stream>>>(xp, op, ids.data_ptr(), sp, np, (int)cap, (int)slots, tk, 2, ne, kb, tp, ps);
+  // clang-format on
+}
+
+void moe_glu_had_in_ptr_compact(const at::Tensor& gu, const at::Tensor& ptrs, int64_t field, const at::Tensor& ids,
+                                const at::Tensor& sorted, const at::Tensor& npost, at::Tensor& act_tmp, at::Tensor& xd) {
+  const at::cuda::OptionalCUDAGuard device_guard(gu.device());
+  check_ptrs(ptrs, field);
+  TORCH_CHECK(gu.dim() == 2 && gu.dtype() == at::kHalf && gu.is_contiguous() && gu.size(1) % 256 == 0);
+  const int64_t slots = gu.size(0), inter = gu.size(1) / 2, cap = sorted.numel();
+  TORCH_CHECK(is_index(ids) && ids.is_contiguous() && ids.numel() == slots);
+  TORCH_CHECK(sorted.dtype() == at::kInt && npost.dtype() == at::kInt && npost.numel() == 1);
+  if (slots == 0) return;
+  const int kb = (int)(inter / 128);
+  const int gb = (int)std::min<int64_t>(8448, (cap * kb + 7) / 8);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  const int64_t* tp = ptrs.data_ptr<int64_t>() + field; const int ps = (int)ptrs.size(1);
+  if (ids.dtype() == at::kLong)
+    trellis_moe_glu_had_in_compact_kernel<true><<<gb, 256, 0, stream>>>((const half*)gu.data_ptr(), (half*)xd.data_ptr(), (half*)act_tmp.data_ptr(), ids.data_ptr(), sorted.data_ptr<int>(), npost.data_ptr<int>(), (int)cap, (int)slots, (int)ptrs.size(0), kb, tp, ps);
+  else
+    trellis_moe_glu_had_in_compact_kernel<false><<<gb, 256, 0, stream>>>((const half*)gu.data_ptr(), (half*)xd.data_ptr(), (half*)act_tmp.data_ptr(), ids.data_ptr(), sorted.data_ptr<int>(), npost.data_ptr<int>(), (int)cap, (int)slots, (int)ptrs.size(0), kb, tp, ps);
 }
 
 void moe_had_in_ptr(const at::Tensor& x, const at::Tensor& ptrs, int64_t field, int64_t shards, const at::Tensor& ids,
@@ -976,6 +1080,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("wb") = py::none());
   m.def("moe_copy_fields", &moe_copy_fields, "per routed slot: copy nbytes from src[e, field] to dst[e, field] where dst != 0",
         py::arg("src"), py::arg("dst"), py::arg("ids"), py::arg("field"), py::arg("nbytes"));
+  m.def("moe_had_in_ptr_compact", &moe_had_in_ptr_compact, "K08: moe_had_in_ptr over the slots of one align output only");
+  m.def("moe_glu_had_in_ptr_compact", &moe_glu_had_in_ptr_compact, "K08: moe_glu_had_in_ptr over the slots of one align output only");
   m.def("moe_had_in_ptr", &moe_had_in_ptr, "moe_had_in with suh from the pointer table",
         py::arg("x"), py::arg("ptrs"), py::arg("field"), py::arg("shards"), py::arg("ids"), py::arg("xh"));
   m.def("moe_glu_had_in_ptr", &moe_glu_had_in_ptr, "moe_glu_had_in with suh_down from the pointer table",

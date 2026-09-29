@@ -70,6 +70,10 @@ if moe_mode != "0":
     # cb 13 = MCG through a 128 KB shared-memory table: decode block families only (0 = 8 rows, 1 = 16 rows); larger
     # families have no shared memory left for the table. TRELLIS_MOE_LUT=0 leaves it out of the build.
     moe_variants = [(mb, cb, kb) for mb in moe_mbs for cb in moe_cbs for kb in moe_bits]
+    # K08: fp16-accumulate prefill variants (cb 10 + codebook) for the prefill block families (16..64 rows)
+    if os.environ.get("TRELLIS_MOE_ACC16", "1") == "1":
+        moe_variants += [(mb, str(10 + int(cb)), kb) for mb in moe_mbs if mb != "0" for cb in moe_cbs if cb in ("1", "2")
+                         for kb in moe_bits]
     if os.environ.get("TRELLIS_MOE_LUT", "0") == "1" and "1" in moe_cbs:   # off: dead end at decode sizes
         moe_variants += [(mb, "13", kb) for mb in moe_mbs if mb in ("0", "1") for kb in moe_bits]
     for mb, cb, kb in moe_variants:
