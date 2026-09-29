@@ -95,7 +95,8 @@ if a.ref and not a.no_tf:
     res["positions"] = n
     print({k: v for k, v in res.items() if k not in ("items", "greedy", "probes")}, flush=True)
 
-    if not a.no_greedy:
+if a.ref and not a.no_greedy:
+        ref = json.load(open(a.ref))
         for i, it in enumerate(ref):
             img = data_url(os.path.join(a.images, it["file"]))
             text = it.get("text_srv") or TEMPLATE.format(q=it["question"])
