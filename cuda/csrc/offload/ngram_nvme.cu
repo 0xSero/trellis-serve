@@ -582,7 +582,8 @@ private:
             int64_t n;
             {
                 std::unique_lock<std::mutex> g(pool_mu_);
-                pool_cv_.wait(g, [&] { return pool_quit_ || pool_gen_ != seen; });
+                // only the first pool_want_ workers take part in a generation (small requests wake few threads)
+                pool_cv_.wait(g, [&] { return pool_quit_ || (pool_gen_ != seen && tid < pool_want_); });
                 if (pool_quit_) return;
                 seen = pool_gen_;
                 n = pool_n_;
@@ -630,7 +631,8 @@ private:
             {
                 std::lock_guard<std::mutex> g(pool_mu_);
                 pool_n_ = n;
-                pool_active_.store(threads_ - 1);
+                pool_want_ = (int) std::min<int64_t>(threads_, n);
+                pool_active_.store(pool_want_ - 1);
                 pool_gen_++;
             }
             pool_cv_.notify_all();
@@ -714,6 +716,7 @@ private:
     std::atomic<int64_t> pool_next_{0}, pool_done_{0};
     std::atomic<int> pool_active_{0};
     int64_t pool_n_ = 0;
+    int pool_want_ = 0;
     // service
     std::thread svc_;
     std::atomic<bool> svc_quit_{false};
