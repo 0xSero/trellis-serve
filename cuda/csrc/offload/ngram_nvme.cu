@@ -282,6 +282,8 @@ public:
     // dry run: cache bookkeeping only, no reads (hit-rate simulation on large corpora)
     void set_dry(bool d) { dry_ = d; }
     void set_policy(int64_t p) { policy_ = (int) p; }
+    // buffered/mmap: drop each read span from the page cache right after copying it (no page-cache growth)
+    void set_pc_drop(bool d) { pc_drop_ = d; }
     // evict this file's clean pages from the page cache (per-file POSIX_FADV_DONTNEED; nothing system-wide)
     int64_t drop_file_cache()
     {
@@ -602,11 +604,17 @@ private:
                 const Run& r = runs_[i];
                 for (int32_t m = r.m0; m < r.m1; ++m)
                     memcpy(slab_ + misses_[m].slot * row_bytes_, fmap_ + misses_[m].off, row_bytes_);
+                if (pc_drop_)
+                {
+                    madvise((void*) (fmap_ + r.off), (size_t) r.len, MADV_DONTNEED);
+                    posix_fadvise(fd_, r.off, r.len, POSIX_FADV_DONTNEED);
+                }
             }
             else
             {
                 read_one(runs_[i], buf);
                 scatter_run(runs_[i], buf);
+                if (pc_drop_ && backend_ == BUFFERED) posix_fadvise(fd_, runs_[i].off, runs_[i].len, POSIX_FADV_DONTNEED);
             }
             pool_done_.fetch_add(1);
         }
@@ -670,6 +678,7 @@ private:
     std::atomic<bool> svc_waiting_{false};
     bool dry_ = false;
     int policy_ = CLOCK;
+    bool pc_drop_ = false;
     std::string path_;
     const uint8_t* fmap_ = nullptr;
     size_t fmap_bytes_ = 0;
@@ -820,6 +829,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("set_warm_chunk", &RowStore::set_warm_chunk)
         .def("set_dry", &RowStore::set_dry)
         .def("set_policy", &RowStore::set_policy)
+        .def("set_pc_drop", &RowStore::set_pc_drop)
         .def("drop_file_cache", &RowStore::drop_file_cache)
         .def("read_slots", &RowStore::read_slots)
         .def("start_service", &RowStore::start_service)

@@ -315,8 +315,9 @@ def main():
         out = []
         g = torch.Generator().manual_seed(7)
         for cfg in a.io_cfgs.split(";"):
-            io, thr, cache = cfg.split(",")
+            io, thr, cache = cfg.split(",")[:3]
             os.environ["SGLANG_EXL3_NGRAM_THREADS"] = thr
+            os.environ["SGLANG_EXL3_NGRAM_PC_DROP"] = "1" if cfg.endswith(",drop") else "0"
             tab = make_table(a.model, 1.0, io, 16384)
             if cache == "cold":
                 tab.store.drop_file_cache()
@@ -332,7 +333,7 @@ def main():
                 d1 = dm_reads()
                 c1 = tab.stats(gpu=False)
                 own = c1["bytes"] - c0["bytes"]
-                o = dict(io=io, threads=int(thr), page_cache=cache, n=n, reps=reps, ms_p50=1e3 * pct(ts, 50),
+                o = dict(io=io, threads=int(thr), page_cache=cache, pc_drop=cfg.endswith(",drop"), n=n, reps=reps, ms_p50=1e3 * pct(ts, 50),
                          ms_mean=1e3 * float(np.mean(ts)), ms_max=1e3 * float(np.max(ts)),
                          rows_per_s=n / float(np.median(ts)), own_bytes=own, dm0_read_bytes=d1[1] - d0[1],
                          dm0_read_ios=d1[0] - d0[0])

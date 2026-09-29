@@ -139,6 +139,7 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.nslots = nslots
         pol = _env("SGLANG_EXL3_NGRAM_POLICY", "clock")
         self.store.set_policy({"clock": 0, "gclock": 1, "cold": 2}[pol])
+        self.store.set_pc_drop(_env("SGLANG_EXL3_NGRAM_PC_DROP", "0") == "1")
         self.file_hash = {k: aux[k].long() for k in ("head_offsets", "head_vocab_sizes", "layer_multipliers")}
         self.embedding_dim = 160
         self.num_embeddings = self.num_rows
