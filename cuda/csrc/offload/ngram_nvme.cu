@@ -543,26 +543,29 @@ private:
         }
     }
 
-    // pread pool: workers + caller pull runs from an atomic cursor
+    // pread pool: workers + caller pull runs from an atomic cursor. The caller returns only after every worker has
+    // finished this generation (pool_active_ == 0), so no worker can touch the next request's runs.
     void pool_worker(int tid)
     {
         uint64_t seen = 0;
         while (true)
         {
+            int64_t n;
             {
                 std::unique_lock<std::mutex> g(pool_mu_);
                 pool_cv_.wait(g, [&] { return pool_quit_ || pool_gen_ != seen; });
                 if (pool_quit_) return;
                 seen = pool_gen_;
+                n = pool_n_;
             }
-            pool_run(tid);
+            pool_run(tid, n);
+            pool_active_.fetch_sub(1, std::memory_order_acq_rel);
         }
     }
 
-    void pool_run(int tid)
+    void pool_run(int tid, int64_t n)
     {
         uint8_t* buf = bounce_ + (size_t) tid * max_run_;
-        int64_t n = (int64_t) runs_.size();
         while (true)
         {
             int64_t i = pool_next_.fetch_add(1);
@@ -582,12 +585,15 @@ private:
         {
             {
                 std::lock_guard<std::mutex> g(pool_mu_);
+                pool_n_ = n;
+                pool_active_.store(threads_ - 1);
                 pool_gen_++;
             }
             pool_cv_.notify_all();
+            pool_run(0, n);
+            while (pool_done_.load() < n || pool_active_.load(std::memory_order_acquire) > 0) _mm_pause();
         }
-        pool_run(0);
-        while (pool_done_.load() < n) _mm_pause();
+        else pool_run(0, n);
     }
 
     void service_loop()
@@ -657,6 +663,8 @@ private:
     uint64_t pool_gen_ = 0;
     bool pool_quit_ = false;
     std::atomic<int64_t> pool_next_{0}, pool_done_{0};
+    std::atomic<int> pool_active_{0};
+    int64_t pool_n_ = 0;
     // service
     std::thread svc_;
     std::atomic<bool> svc_quit_{false};

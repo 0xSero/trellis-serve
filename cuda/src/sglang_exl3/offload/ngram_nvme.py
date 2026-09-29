@@ -15,13 +15,17 @@ In SGLang the gather runs on the PLE prefetch stream, started before layer 0, so
 
 Env (read at construction):
   SGLANG_EXL3_NGRAM_TIER        pinned (default, whole table in pinned RAM) | nvme (this module)
-  SGLANG_EXL3_NGRAM_RAM_GB      RAM row-cache budget in GB (default 4; 102 B/row -> 39.2M rows at 4 GB)
-  SGLANG_EXL3_NGRAM_IO          aio (default, O_DIRECT + io_submit) | pread (O_DIRECT, thread pool) | buffered (page cache)
-  SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  pread threads (16)
+  SGLANG_EXL3_NGRAM_RAM_GB      RAM row-cache budget in GB (default 8 = 78.4M rows; N006: after 30M tokens of traffic the
+                                working set was 60.9M rows, so 8 GB = infinite-cache hit rate; 4 GB loses ~4-5 pt)
+  SGLANG_EXL3_NGRAM_IO          pread (default: O_DIRECT, 32-thread pool, ~290k IOPS on the dm-crypt 990 Pro) |
+                                aio (O_DIRECT + io_submit, one issuer, ~185k IOPS) | buffered (page cache; ~2.7M rows/s
+                                when the file is cached, but uses up to 32.6 GB of reclaimable page cache)
+  SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  pread threads (32)
   SGLANG_EXL3_NGRAM_MAX_TOKENS  largest forward (tokens) one lookup may carry (default 32768 -> 524,288 ids)
   SGLANG_EXL3_NGRAM_MAX_RUN     largest coalesced read in bytes (default 65536)
   SGLANG_EXL3_NGRAM_MERGE_GAP   merge two runs if the gap is <= this many bytes (default 0: touching blocks only)
-  SGLANG_EXL3_NGRAM_SPIN_US     service thread busy-polls this long after the last request, then sleeps 20 us (200000)
+  SGLANG_EXL3_NGRAM_SPIN_US     service thread busy-polls this long after the last request, then polls with 20 us sleeps
+                                (default 0: N009 measured fewer outliers and no burned core; +4 us/step when overlapped)
   SGLANG_EXL3_NGRAM_TIMEOUT_S   GPU wait timeout (default 60): on expiry the step continues with stale rows, error set
 """
 from __future__ import annotations
@@ -113,8 +117,8 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.path, self.words, self.K, self.num_rows = t["path"], t["words"], t["K"], t["num_rows"]
         self.prefix = t["prefix"]
         self.row_bytes = self.words * 2
-        ram_gb = float(ram_gb if ram_gb is not None else _env("SGLANG_EXL3_NGRAM_RAM_GB", 4.0, float))
-        io = io or _env("SGLANG_EXL3_NGRAM_IO", "aio")
+        ram_gb = float(ram_gb if ram_gb is not None else _env("SGLANG_EXL3_NGRAM_RAM_GB", 8.0, float))
+        io = io or _env("SGLANG_EXL3_NGRAM_IO", "pread")
         backend = {"aio": 0, "pread": 1, "buffered": 2}[io]
         max_tokens = int(max_tokens or _env("SGLANG_EXL3_NGRAM_MAX_TOKENS", 32768, int))
         aux_names = ("head_bias", "head_offsets", "head_vocab_sizes", "layer_multipliers")
@@ -128,7 +132,7 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.ext = load_ext()
         t0 = time.time()
         self.store = self.ext.RowStore(t["path"], t["row0"], t["rows"], t["offs"], self.row_bytes, nslots, backend,
-                                       _env("SGLANG_EXL3_NGRAM_THREADS", 16, int), _env("SGLANG_EXL3_NGRAM_QD", 128, int),
+                                       _env("SGLANG_EXL3_NGRAM_THREADS", 32, int), _env("SGLANG_EXL3_NGRAM_QD", 128, int),
                                        _env("SGLANG_EXL3_NGRAM_MAX_RUN", 65536, int),
                                        _env("SGLANG_EXL3_NGRAM_MERGE_GAP", 0, int), self.cap)
         self.nslots = nslots
@@ -142,7 +146,7 @@ class Exl3NgramNvmeTable(torch.nn.Module):
             dev = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
             self._attach(dev, aux["head_bias"])
         if start_service and self.device is not None:
-            self.store.start_service(_env("SGLANG_EXL3_NGRAM_SPIN_US", 200000, int))
+            self.store.start_service(_env("SGLANG_EXL3_NGRAM_SPIN_US", 0, int))
         logger.info("EXL3 n-gram table on NVMe (%s): %d rows x %d B, RAM row cache %.2f GB = %d slots, max %d ids/lookup, "
                     "init %.1f s", io, self.num_rows, self.row_bytes, self.ram_gb, nslots, self.cap, time.time() - t0)
 
@@ -266,6 +270,8 @@ class Exl3NgramNvmeTable(torch.nn.Module):
 
 
 _HINT_WARNED = [False]
+_STATS_T = [0.0]
+_STATS_EVERY_S = float(os.environ.get("SGLANG_EXL3_NGRAM_STATS_S", "60"))
 
 
 def install_prefill_hints() -> None:
@@ -273,7 +279,7 @@ def install_prefill_hints() -> None:
 
     Wraps SGLang `Scheduler.get_new_batch_prefill`: after scheduling, if a request is still being chunked
     (`self.chunked_req`), its next `chunked_prefill_size` prompt tokens (after `len(req.fill_ids)`) are hashed on the
-    CPU and warmed asynchronously. Only works when the scheduler and the model worker share a process (tp_size 1).
+    CPU and warmed asynchronously; so are the first chunks of the first two waiting requests (once each). Only works when the scheduler and the model worker share a process (tp_size 1).
     A wrong or late hint costs nothing but hit rate: lookups always go through the normal graph-safe path.
     Disable with SGLANG_EXL3_NGRAM_HINT=0."""
     if os.environ.get("SGLANG_EXL3_NGRAM_HINT", "1") == "0":
@@ -287,20 +293,37 @@ def install_prefill_hints() -> None:
     def get_new_batch_prefill(self, *a, **k):
         out = orig(self, *a, **k)
         try:
-            req = getattr(self, "chunked_req", None)
-            if req is not None:
-                from .ngram_host import _TABLES
-                tabs = [t for t in _TABLES.values() if isinstance(t, Exl3NgramNvmeTable)]
-                if tabs:
-                    tab = tabs[0]
+            from .ngram_host import _TABLES
+            tabs = [t for t in _TABLES.values() if isinstance(t, Exl3NgramNvmeTable)]
+            if tabs:
+                tab = tabs[0]
+                now = time.time()
+                if now - _STATS_T[0] >= _STATS_EVERY_S:
+                    _STATS_T[0] = now
+                    d = tab.stats(gpu=False)
+                    logger.info("n-gram NVMe tier: lookups %d, lookup hit %.3f, unique-row hit %.3f, misses %d, reads %.2f GB, "
+                                "io %.1f s, warm lookups %d / misses %d, resident %d/%d rows, err %d", d["lookups"],
+                                d["lookup_hit_rate"], d["unique_hit_rate"], d["misses"], d["bytes"] / 1e9, d["io_us"] / 1e6,
+                                d["warm_lookups"], d["warm_misses"], d["resident"], tab.nslots, d["error"])
+                eos = getattr(tab, "eos_token_id", None)
+                size = int(getattr(self, "chunked_prefill_size", 0) or 8192)
+                req = getattr(self, "chunked_req", None)
+                if req is not None:
+                    # next chunk of the request being chunked
                     ids = list(req.origin_input_ids)
                     # SGLang 0.5.20: Req.get_fill_ids() (up to the scheduled chunk's end); older: Req.fill_ids
                     start = len(req.get_fill_ids()) if hasattr(req, "get_fill_ids") else len(req.fill_ids)
-                    size = int(getattr(self, "chunked_prefill_size", 0) or 8192)
                     if 0 < start < len(ids):
-                        eos = getattr(tab, "eos_token_id", None)
                         hist = ([eos, eos] + ids[:start])[-2:]
                         tab.hint_tokens(ids[start:start + size], history=hist, eos=eos)
+                # first chunk of the next waiting requests (each once)
+                for w in list(getattr(self, "waiting_queue", []) or [])[:2]:
+                    if getattr(w, "_exl3_ngram_hinted", False):
+                        continue
+                    w._exl3_ngram_hinted = True
+                    ids = list(w.origin_input_ids)[:size]
+                    if ids:
+                        tab.hint_tokens(ids, history=[eos, eos], eos=eos)
         except Exception as e:  # never break scheduling for a hint
             if not _HINT_WARNED[0]:
                 _HINT_WARNED[0] = True
