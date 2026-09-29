@@ -15,9 +15,12 @@ In SGLang the gather runs on the PLE prefetch stream, started before layer 0, so
 
 Env (read at construction):
   SGLANG_EXL3_NGRAM_TIER        pinned (default, whole table in pinned RAM) | nvme (this module)
-  SGLANG_EXL3_NGRAM_RAM_GB      RAM row-cache budget in GB (default 4; 102 B/row -> 39.2M rows at 4 GB)
-  SGLANG_EXL3_NGRAM_IO          aio (default, O_DIRECT + io_submit) | pread (O_DIRECT, thread pool) | buffered (page cache)
-  SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  pread threads (16)
+  SGLANG_EXL3_NGRAM_RAM_GB      RAM row-cache budget in GB (default 8 = 78.4M rows; N006: after 30M tokens of traffic the
+                                working set was 60.9M rows, so 8 GB = infinite-cache hit rate; 4 GB loses ~4-5 pt)
+  SGLANG_EXL3_NGRAM_IO          pread (default: O_DIRECT, 32-thread pool, ~290k IOPS on the dm-crypt 990 Pro) |
+                                aio (O_DIRECT + io_submit, one issuer, ~185k IOPS) | buffered (page cache; ~2.7M rows/s
+                                when the file is cached, but uses up to 32.6 GB of reclaimable page cache)
+  SGLANG_EXL3_NGRAM_QD          aio queue depth (default 128)          SGLANG_EXL3_NGRAM_THREADS  pread threads (32)
   SGLANG_EXL3_NGRAM_MAX_TOKENS  largest forward (tokens) one lookup may carry (default 32768 -> 524,288 ids)
   SGLANG_EXL3_NGRAM_MAX_RUN     largest coalesced read in bytes (default 65536)
   SGLANG_EXL3_NGRAM_MERGE_GAP   merge two runs if the gap is <= this many bytes (default 0: touching blocks only)
@@ -114,8 +117,8 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.path, self.words, self.K, self.num_rows = t["path"], t["words"], t["K"], t["num_rows"]
         self.prefix = t["prefix"]
         self.row_bytes = self.words * 2
-        ram_gb = float(ram_gb if ram_gb is not None else _env("SGLANG_EXL3_NGRAM_RAM_GB", 4.0, float))
-        io = io or _env("SGLANG_EXL3_NGRAM_IO", "aio")
+        ram_gb = float(ram_gb if ram_gb is not None else _env("SGLANG_EXL3_NGRAM_RAM_GB", 8.0, float))
+        io = io or _env("SGLANG_EXL3_NGRAM_IO", "pread")
         backend = {"aio": 0, "pread": 1, "buffered": 2}[io]
         max_tokens = int(max_tokens or _env("SGLANG_EXL3_NGRAM_MAX_TOKENS", 32768, int))
         aux_names = ("head_bias", "head_offsets", "head_vocab_sizes", "layer_multipliers")
@@ -129,7 +132,7 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         self.ext = load_ext()
         t0 = time.time()
         self.store = self.ext.RowStore(t["path"], t["row0"], t["rows"], t["offs"], self.row_bytes, nslots, backend,
-                                       _env("SGLANG_EXL3_NGRAM_THREADS", 16, int), _env("SGLANG_EXL3_NGRAM_QD", 128, int),
+                                       _env("SGLANG_EXL3_NGRAM_THREADS", 32, int), _env("SGLANG_EXL3_NGRAM_QD", 128, int),
                                        _env("SGLANG_EXL3_NGRAM_MAX_RUN", 65536, int),
                                        _env("SGLANG_EXL3_NGRAM_MERGE_GAP", 0, int), self.cap)
         self.nslots = nslots
