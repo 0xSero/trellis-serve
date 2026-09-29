@@ -270,6 +270,8 @@ class Exl3NgramNvmeTable(torch.nn.Module):
 
 
 _HINT_WARNED = [False]
+_STATS_T = [0.0]
+_STATS_EVERY_S = float(os.environ.get("SGLANG_EXL3_NGRAM_STATS_S", "60"))
 
 
 def install_prefill_hints() -> None:
@@ -295,6 +297,14 @@ def install_prefill_hints() -> None:
             tabs = [t for t in _TABLES.values() if isinstance(t, Exl3NgramNvmeTable)]
             if tabs:
                 tab = tabs[0]
+                now = time.time()
+                if now - _STATS_T[0] >= _STATS_EVERY_S:
+                    _STATS_T[0] = now
+                    d = tab.stats(gpu=False)
+                    logger.info("n-gram NVMe tier: lookups %d, lookup hit %.3f, unique-row hit %.3f, misses %d, reads %.2f GB, "
+                                "io %.1f s, warm lookups %d / misses %d, resident %d/%d rows, err %d", d["lookups"],
+                                d["lookup_hit_rate"], d["unique_hit_rate"], d["misses"], d["bytes"] / 1e9, d["io_us"] / 1e6,
+                                d["warm_lookups"], d["warm_misses"], d["resident"], tab.nslots, d["error"])
                 eos = getattr(tab, "eos_token_id", None)
                 size = int(getattr(self, "chunked_prefill_size", 0) or 8192)
                 req = getattr(self, "chunked_req", None)
