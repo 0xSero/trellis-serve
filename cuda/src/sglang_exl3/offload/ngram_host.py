@@ -177,10 +177,24 @@ class Exl3NgramHostTable(torch.nn.Module):
         return self.gather(ids).view(*ids.shape, 160)
 
 
-def get_table(model_path: str) -> Exl3NgramHostTable:
+def tier() -> str:
+    """SGLANG_EXL3_NGRAM_TIER: `pinned` (default: whole table in pinned RAM) or `nvme` (ngram_nvme: rows read from the
+    safetensors file with O_DIRECT behind a SGLANG_EXL3_NGRAM_RAM_GB row cache)."""
+    t = os.environ.get("SGLANG_EXL3_NGRAM_TIER", "pinned").strip().lower() or "pinned"
+    if t not in ("pinned", "nvme"):
+        raise ValueError(f"SGLANG_EXL3_NGRAM_TIER={t!r}: expected pinned or nvme")
+    return t
+
+
+def get_table(model_path: str):
     t = _TABLES.get(model_path)
     if t is None:
-        t = _TABLES[model_path] = Exl3NgramHostTable(model_path)
+        if tier() == "nvme":
+            from .ngram_nvme import Exl3NgramNvmeTable
+            t = Exl3NgramNvmeTable(model_path)
+        else:
+            t = Exl3NgramHostTable(model_path)
+        _TABLES[model_path] = t
     return t
 
 
@@ -224,8 +238,9 @@ def install() -> None:
                 logger.warning("n-gram hash constant %s differs from the file (%s vs %s): using the file's", name,
                                buf.cpu().tolist()[:4], ref.tolist()[:4])
                 buf.copy_(ref.to(buf.device))
-        logger.info("%s: n-gram table served from pinned host memory (EXL3 K=%d rows, zero-copy gather + decode)",
-                    prefix, table.K)
+        table.eos_token_id = int(getattr(self, "eos_token_id", -1))
+        logger.info("%s: n-gram table served from %s (EXL3 K=%d rows, zero-copy gather + decode)", prefix,
+                    "NVMe + RAM row cache" if tier() == "nvme" else "pinned host memory", table.K)
 
     cls.__init__ = __init__
     cls._exl3_patched = True
@@ -236,7 +251,7 @@ def install() -> None:
 
     class Qwen4ExpPinnedHostEmbeddingExl3(base):
         def __new__(klass, embedding, *a, **k):
-            if isinstance(embedding, Exl3NgramHostTable):
+            if isinstance(embedding, Exl3NgramHostTable) or type(embedding).__name__ == "Exl3NgramNvmeTable":
                 return embedding
             obj = base.__new__(base)
             obj.__init__(embedding, *a, **k)
