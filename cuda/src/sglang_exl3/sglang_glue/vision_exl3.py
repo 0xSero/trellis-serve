@@ -123,6 +123,18 @@ def _to_fp16(visual) -> None:
     logger.info("sglang-exl3: vision tower runs in fp16 (output cast to %s)", out_dtype)
 
 
+def _dump_hook(visual, path: str) -> None:
+    """Debug (SGLANG_EXL3_VISION_DUMP=<dir>): save every ViT output (image embeddings) as <dir>/vit_<n>.pt."""
+    orig, n = visual.forward, [0]
+
+    def forward(*a, **k):
+        y = orig(*a, **k)
+        os.makedirs(path, exist_ok=True)
+        torch.save(y.detach().float().cpu(), os.path.join(path, f"vit_{n[0]}.pt")); n[0] += 1
+        return y
+    visual.forward = forward
+
+
 def _patch_load(cls) -> None:
     if "_exl3_vision" in cls.__dict__:
         return
@@ -167,6 +179,8 @@ def _patch_load(cls) -> None:
             _install_visual(self, qc, vis)
             if os.environ.get("SGLANG_EXL3_VISION_FP16", "0") == "1":
                 _to_fp16(self.visual)
+            if os.environ.get("SGLANG_EXL3_VISION_DUMP"):
+                _dump_hook(self.visual, os.environ["SGLANG_EXL3_VISION_DUMP"])
         return out
 
     cls.__init__, cls.load_weights, cls._exl3_vision = __init__, load_weights, True
