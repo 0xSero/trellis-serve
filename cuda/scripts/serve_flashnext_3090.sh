@@ -27,7 +27,7 @@ exec python3 -m sglang.launch_server --model-path /models/$MODEL --quantization 
  --cuda-graph-backend-prefill disabled --max-mamba-cache-size ${MAMBA:-16} --max-total-tokens ${MAXTOK:-210000}"
 for a in "$@"; do INNER+=" $(printf '%q' "$a")"; done
 docker rm -f "$NAME" >/dev/null 2>&1
-ARGV=(docker run --rm --name "$NAME" --gpus "device=$GPU" --ipc=host --shm-size 64g --ulimit memlock=-1
+ARGV=(docker run --rm --name "$NAME" --gpus "device=$GPU" --ipc=host --shm-size 64g --ulimit memlock=-1 --memory ${MEM_LIMIT:-100g}
   -p 127.0.0.1:$PORT:$PORT
   -e HF_HUB_OFFLINE=1 -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e SGLANG_EXL3_MODEL_PATH=/models/$MODEL
   -e SGLANG_EXL3_MOE_OFFLOAD=${SGLANG_EXL3_MOE_OFFLOAD:-gpu_cache} -e EXL3_MOE_CPU_THREADS=${THREADS:-24}
