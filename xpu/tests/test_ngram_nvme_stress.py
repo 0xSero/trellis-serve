@@ -5,24 +5,87 @@ The arm is chosen by EXL3_NVME_PUBLISH (store | atomic, read by the extension) a
   eager lookups of mixed sizes (decode-sized 16 ids up to the 524,288-id capacity), back to back with no host sync
   between some of them (rapid buffer reuse), and
   XPU-graph replays of decode-shaped lookups (T=1, T=2) with fresh ids copied in before every replay, as SGLang decode does.
---seconds is stress-loop time, measured after setup (exposure_s). Every result is compared bit for bit with the pinned-RAM table (a separate, atomic-free path). The extension's error
-word and the GPU wait count are checked against the number of lookups issued. Progress JSON is rewritten every 10 s so
-the exposure before a device loss survives the process.
+--seconds is stress-loop time, measured after setup (exposure_s). Every result is compared bit for bit with a pinned-RAM
+reference (the pinned tier's own gather/dequant kernel over one host chunk: a separate, atomic-free path). The reference
+holds only rows [0, --ref-rows) and every test id is drawn from that range, so the check costs ~2 GB of pinned RAM
+instead of the full 32.6 GB table (which left the dev window ~7 GB above its memory floor). The publish/wait handshake
+under test writes the same buffers whatever the id values are. The extension's error word and the GPU wait count are
+checked against the number of lookups issued. Progress JSON is rewritten every 10 s so the exposure before a device
+loss survives the process.
 Exit: 0 clean, 1 integrity failure, 3 device/runtime error.
 """
-import argparse, json, os, sys, time, traceback
+import argparse, json, os, re, sys, time, traceback
 import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from exl3xpu.ngram_host import Exl3NgramHostTable
+from exl3xpu.ngram_host import FILE, _header, _read_small
 from exl3xpu.ngram_nvme import Exl3NgramNvmeTable
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="/model")
 ap.add_argument("--seconds", type=float, default=600)
-ap.add_argument("--ram-gb", type=float, default=2.0)
+ap.add_argument("--ram-gb", type=float, default=0.5, help="NVMe tier RAM row cache (small, so lookups still miss)")
+ap.add_argument("--ref-rows", type=int, default=20_000_000, help="rows held by the reference; ids are drawn below this")
 ap.add_argument("--out", required=True)
 ap.add_argument("--seed", type=int, default=0)
 a = ap.parse_args()
+
+
+class SubsetRef:
+    """Pinned-RAM reference over rows [0, rows): Exl3NgramHostTable's gather (ngram_gather_dequant) with one chunk."""
+
+    def __init__(self, model, rows):
+        from exl3xpu.moe_offload import ops, s64
+        path = os.path.join(model, FILE)
+        hdr, base = _header(path)
+        meta = hdr.pop("__metadata__", {}) or {}
+        if meta.get("format") != "exl3_ngram_trellis":
+            raise ValueError(f"{path}: not an exl3_ngram_trellis table ({meta.get('format')!r})")
+        shards, prefix = {}, None
+        for k, v in hdr.items():
+            m = re.match(r"(.*)\.shard_(\d+)\.trellis$", k)
+            if m:
+                shards[int(m.group(2))] = v
+                prefix = m.group(1)
+        if not shards or sorted(shards) != list(range(len(shards))):
+            raise ValueError(f"{path}: shard_N.trellis tensors missing or not contiguous")
+        self.words = shards[0]["shape"][1]
+        self.K = (self.words - 1) * 16 // 160
+        if self.K != int(meta.get("K", self.K)) or 1 + 160 * self.K // 16 != self.words:
+            raise ValueError(f"{path}: row width {self.words} does not match K={meta.get('K')}")
+        if any(shards[i]["shape"][1] != self.words for i in shards):
+            raise ValueError(f"{path}: shards differ in row width")
+        rb = self.words * 2
+        self.num_rows = min(rows, sum(shards[i]["shape"][0] for i in shards))
+        self.X = ops()
+        self.chunk = self.X.host_alloc(self.num_rows * rb)
+        mv = memoryview(self.chunk.numpy())
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            done = 0
+            for i in range(len(shards)):
+                if done >= self.num_rows:
+                    break
+                a0, _ = shards[i]["data_offsets"]
+                ln = min(shards[i]["shape"][0], self.num_rows - done) * rb
+                off = 0
+                while off < ln:
+                    n = os.preadv(fd, [mv[done * rb + off: done * rb + min(ln, off + (64 << 20))]], base + a0 + off)
+                    if n <= 0:
+                        raise IOError(f"{path}: short read")
+                    off += n
+                done += ln // rb
+        finally:
+            os.close(fd)
+        d = torch.device("xpu", torch.xpu.current_device())
+        self.head_bias = _read_small(path, base, hdr[f"{prefix}.head_bias"]).to(d, torch.float16).contiguous()
+        self.chunk_ptrs = torch.tensor([s64(self.chunk.data_ptr())], dtype=torch.int64, device=d)
+
+    def gather(self, ids):
+        flat = ids.reshape(-1).to(torch.long).contiguous()
+        out = torch.empty((*ids.shape, 160), dtype=torch.bfloat16, device=ids.device)
+        self.X.ngram_gather_dequant(flat, self.chunk_ptrs, self.num_rows, self.num_rows, self.words, self.K,
+                                    self.head_bias, out)
+        return out
 
 dev = torch.device("xpu", 0)
 g = torch.Generator().manual_seed(a.seed)
@@ -43,7 +106,7 @@ def dump():
 
 def rand_ids(T, hot):
     # half the rows from a small hot set (cache hits), half uniform (misses -> NVMe reads)
-    ids = torch.randint(0, nv.num_rows, (T, 16), generator=g, dtype=torch.int64)
+    ids = torch.randint(0, ho.num_rows, (T, 16), generator=g, dtype=torch.int64)
     m = torch.rand((T, 16), generator=g) < 0.5
     ids[m] = hot[torch.randint(0, hot.numel(), (int(m.sum()),), generator=g)]
     return ids.to(dev)
@@ -60,9 +123,10 @@ try:
     dump()
     t0 = time.time()
     nv = Exl3NgramNvmeTable(a.model, ram_gb=a.ram_gb, device=dev)
-    ho = Exl3NgramHostTable(a.model)
+    ho = SubsetRef(a.model, a.ref_rows)
+    st["ref_rows"] = ho.num_rows; st["ram_gb"] = a.ram_gb
     st["setup_s"] = round(time.time() - t0, 1)
-    hot = torch.randint(0, nv.num_rows, (4096,), generator=g, dtype=torch.int64)
+    hot = torch.randint(0, ho.num_rows, (4096,), generator=g, dtype=torch.int64)
     # decode graphs, captured as SGLang does (side stream warm-up, then capture)
     graphs = {}
     for T in (1, 2):
