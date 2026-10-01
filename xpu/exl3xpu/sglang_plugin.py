@@ -1207,12 +1207,16 @@ def activate() -> None:
             qsa_xpu.install()
             import sys as _sys
             print("EXL3 qsa_xpu installed", file=_sys.stderr, flush=True)
+        except Exception as e:  # pragma: no cover
+            logger.warning("exl3xpu: QSA XPU shim not installed (%s)", e)
+        try:
             from . import qsa_prefill_mem
             on = qsa_prefill_mem.install()
+            import sys as _sys
             print(f"EXL3 qsa prefill row-chunk budget {'on' if on else 'off'} "
                   f"({qsa_prefill_mem._BUDGET >> 20} MiB)", file=_sys.stderr, flush=True)
         except Exception as e:  # pragma: no cover
-            logger.warning("exl3xpu: QSA XPU shim not installed (%s)", e)
+            logger.warning("exl3xpu: QSA prefill row-chunk budget not installed, upstream chunking (%s)", e)
     if os.environ.get("EXL3_MODTIME", "0") == "1":
         try:
             from . import modtime

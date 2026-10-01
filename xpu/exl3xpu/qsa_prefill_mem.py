@@ -5,7 +5,7 @@
 real peak is far larger than the logits: it materialises `scores[rows, keys, heads]` in fp32, a second tensor of the
 same size for `relu`, then the summed logits, the scaled logits, the column/validity masks and the masked result.
 With Flash-Next's 4 indexer heads a 2048-row chunk at a 64K context (~16K compressed keys) peaks near 1.3 GB instead of
-128 MiB, which exceeded the stage-1 headroom under the 0.91 per-stage cap (observed: OOM on a
+128 MiB, which exceeded a pipeline stage's free memory serving Flash-Next on two B70s (observed: OOM on a
 124 MiB logits allocation during a 64K prefill with a concurrent request).
 
 This replaces `_qsa_prefill_row_chunk_size` with one that budgets the whole fallback: per row,
@@ -52,6 +52,9 @@ def install() -> bool:
     if torch.cuda.is_available() or not (hasattr(torch, "xpu") and torch.xpu.is_available()):
         return False
     from sglang.srt.layers.attention.qsa import qsa_indexer as qi
+    if not hasattr(qi, "_qsa_prefill_row_chunk_size"):
+        logger.warning("exl3xpu: this SGLang has no _qsa_prefill_row_chunk_size; row-chunk budget not installed")
+        return False
     if getattr(qi._qsa_prefill_row_chunk_size, "_exl3", False):
         return True
     row_chunk_size._exl3 = True
