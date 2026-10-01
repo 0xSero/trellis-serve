@@ -67,11 +67,48 @@ _DENSE_MIN_ROWS = int(os.environ.get("EXL3_QSA_DENSE_MIN_ROWS", "64"))
 _DENSE_SCORE_BYTES = int(os.environ.get("EXL3_QSA_DENSE_BYTES", str(384 << 20)))
 
 
+_UNION_MODES = ("orig", "perhead", "auto")
+
+
+def _union_setting(name: str, default: str, ok) -> str:
+    """A malformed setting falls back to its default with an error; it never selects another mode."""
+    raw = os.environ.get(name, default)
+    try:
+        if ok(raw):
+            return raw
+    except ValueError:
+        pass
+    import sys as _sys
+    print(f"EXL3 qsa: ignoring {name}={raw!r}, using {default}", file=_sys.stderr, flush=True)
+    logger.error("exl3xpu: ignoring %s=%r, using %s", name, raw, default)
+    return default
+
+
+_UNION_MEM = _union_setting("EXL3_QSA_UNION_MEM", "orig", lambda v: v in _UNION_MODES)   # orig is the default
+_UNION_GATHER_SLOTS = int(_union_setting("EXL3_QSA_UNION_GATHER_SLOTS", "16384", lambda v: int(v) > 0))
+_UNION_PERHEAD_MIN = int(_union_setting("EXL3_QSA_UNION_PERHEAD_MIN", "32768", lambda v: int(v) >= 0))
+
+
 def qsa_sparse_attention_union(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
-                               token_slots: torch.Tensor, softmax_scale: Optional[float] = None) -> torch.Tensor:
+                               token_slots: torch.Tensor, softmax_scale: Optional[float] = None,
+                               mode: Optional[str] = None) -> torch.Tensor:
     """Exactly the sparse attention, computed as dense attention over the UNION of the selected slots with every
     non-selected (row, key) pair masked to -inf: K/V gathered once per call instead of once per query row, bf16 GEMMs.
-    Prefill only (data-dependent union size -> host sync, not capturable)."""
+    Prefill only (data-dependent union size -> host sync, not capturable).
+
+    The gathered K/V grow with the union, which grows with the context. Memory modes (EXL3_QSA_UNION_MEM):
+      orig    : gather the union, convert to bf16, then make the permuted copies (~3.5 KB per union slot at the peak
+                for 2 KV heads x 256 with an fp8 cache: fp8 gather + bf16 + permuted copy alive together)
+      perhead : one KV head at a time, preallocating that head's permuted bf16 K/V and filling them in slot chunks
+                (EXL3_QSA_UNION_GATHER_SLOTS) straight from the cache, fp8 -> bf16 being exact (~1 KB per slot);
+                smaller GEMMs, so results differ from orig at bf16-rounding level
+      auto    : perhead when the union has >= EXL3_QSA_UNION_PERHEAD_MIN slots (long contexts, where the memory
+                is), orig otherwise (short prompts stay bit-identical)
+    """
+    if mode is None:
+        mode = _UNION_MEM
+    if mode not in _UNION_MODES:
+        raise ValueError(f"qsa_sparse_attention_union: mode {mode!r} is not one of {_UNION_MODES}")
     scale = softmax_scale or q.shape[-1] ** -0.5
     R, Hq, D = q.shape
     Hk = k_cache.shape[1]
@@ -82,25 +119,42 @@ def qsa_sparse_attention_union(q: torch.Tensor, k_cache: torch.Tensor, v_cache: 
     out = torch.zeros_like(q)
     if nu == 0:
         return out
+    if mode == "auto":
+        mode = "perhead" if nu >= _UNION_PERHEAD_MIN else "orig"
     # invalid (-1) entries go to a spare column nu (dropped): writing them anywhere real could clear a selected key
     col = torch.where(valid, torch.searchsorted(uni, token_slots.clamp_min(0).to(uni.dtype)),
                       torch.full_like(token_slots, nu, dtype=torch.long))
-    kk = k_cache.index_select(0, uni.long()).to(torch.bfloat16).permute(1, 2, 0).contiguous()   # [Hk, D, nu]
-    vv = v_cache.index_select(0, uni.long()).to(torch.bfloat16).transpose(0, 1).contiguous()   # [Hk, nu, D]
     B = max(8, min(R, _DENSE_SCORE_BYTES // max(1, Hq * nu * 6)))
-    for r0 in range(0, R, B):
-        r1 = min(R, r0 + B)
-        n = r1 - r0
-        mask = torch.zeros((n, nu + 1), dtype=torch.bool, device=q.device)
-        mask.scatter_(1, col[r0:r1].long(), True)
-        mask = mask[:, :nu]
-        qq = q[r0:r1].to(torch.bfloat16).view(n, Hk, G, D).permute(1, 0, 2, 3).reshape(Hk, n * G, D)
-        sc = torch.matmul(qq, kk).view(Hk, n, G, nu).float() * scale
-        sc.masked_fill_(~mask[None, :, None, :], -float("inf"))
-        p = torch.softmax(sc, dim=-1)
-        p = torch.nan_to_num_(p, nan=0.0).to(torch.bfloat16).view(Hk, n * G, nu)
-        o = torch.matmul(p, vv).view(Hk, n, G, D).permute(1, 0, 2, 3).reshape(n, Hq, D)
-        out[r0:r1] = o.to(q.dtype)
+    ul = uni.long()
+    if mode == "orig":
+        groups = [(0, Hk, k_cache.index_select(0, ul).to(torch.bfloat16).permute(1, 2, 0).contiguous(),
+                   v_cache.index_select(0, ul).to(torch.bfloat16).transpose(0, 1).contiguous())]
+    else:
+        groups = [(h, h + 1, None, None) for h in range(Hk)]
+    for h0, h1, kk, vv in groups:
+        hk = h1 - h0
+        if kk is None:
+            kk = torch.empty((hk, D, nu), dtype=torch.bfloat16, device=q.device)       # [hk, D, nu]
+            vv = torch.empty((hk, nu, D), dtype=torch.bfloat16, device=q.device)       # [hk, nu, D]
+            for c0 in range(0, nu, _UNION_GATHER_SLOTS):
+                c1 = min(nu, c0 + _UNION_GATHER_SLOTS)
+                idx = ul[c0:c1]
+                kk[:, :, c0:c1].copy_(k_cache.index_select(0, idx)[:, h0:h1].permute(1, 2, 0))
+                vv[:, c0:c1].copy_(v_cache.index_select(0, idx)[:, h0:h1].transpose(0, 1))
+        for r0 in range(0, R, B):
+            r1 = min(R, r0 + B)
+            n = r1 - r0
+            mask = torch.zeros((n, nu + 1), dtype=torch.bool, device=q.device)
+            mask.scatter_(1, col[r0:r1].long(), True)
+            mask = mask[:, :nu]
+            qq = q[r0:r1].to(torch.bfloat16).view(n, Hk, G, D)[:, h0:h1].permute(1, 0, 2, 3).reshape(hk, n * G, D)
+            sc = torch.matmul(qq, kk).view(hk, n, G, nu).float() * scale
+            sc.masked_fill_(~mask[None, :, None, :], -float("inf"))
+            p = torch.softmax(sc, dim=-1)
+            p = torch.nan_to_num_(p, nan=0.0).to(torch.bfloat16).view(hk, n * G, nu)
+            o = torch.matmul(p, vv).view(hk, n, G, D).permute(1, 0, 2, 3).reshape(n, hk * G, D)
+            out[r0:r1, h0 * G:h1 * G] = o.to(q.dtype)
+        del kk, vv
     return out
 
 
@@ -130,6 +184,9 @@ def install() -> None:
                 setattr(m, name, fn)
                 patched.append(f"{mod_name.rsplit('.', 1)[-1]}.{name}")
     logger.info("exl3xpu: QSA XPU shim: vectorised top-k + sparse attention (%s)", ", ".join(patched))
+    import sys as _sys
+    print(f"EXL3 qsa union memory mode {_UNION_MEM} (per-head from {_UNION_PERHEAD_MIN} slots)", file=_sys.stderr,
+          flush=True)
     if os.environ.get("EXL3_QSA_GRAPH_KERNELS", "1") == "1":
         # XPU graph replay: SGLang refreshes the QSA graph metadata with Triton kernels on CUDA only and otherwise uses
         # a host "slow-path" fallback, with which graph-replayed decode degenerates on the B70 (eager is correct).
