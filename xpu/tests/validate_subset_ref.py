@@ -1,4 +1,4 @@
-"""One-time check that the stress test's SubsetRef equals the full pinned table (Exl3NgramHostTable) on rows [0, N).
+"""One-time check that the stress test's SubsetRef (ngram_subset_ref.py) equals the full pinned table (Exl3NgramHostTable) on rows [0, N).
 
 Loads both (~35 GB pinned for a minute), compares gathers bit for bit on random ids including the range edges and
 every shard boundary below N, frees the full table, and writes a JSON verdict. No NVMe tier, no atomics.
@@ -17,14 +17,10 @@ a = ap.parse_args()
 res = dict(ref_rows=a.ref_rows, ids=a.ids, status="setup", started=time.time())
 try:
     from exl3xpu.ngram_host import Exl3NgramHostTable, FILE, _header
-    src = open(os.path.join(HERE, "test_ngram_nvme_stress.py")).read()
-    ns = {}
-    # take the SubsetRef class exactly as the stress test defines it (importing the test would run it)
-    start = src.index("class SubsetRef:")
-    end = src.index("\ndev = torch.device(", start)
-    exec("import os, re, torch\nfrom exl3xpu.ngram_host import FILE, _header, _read_small\n" + src[start:end], ns)
+    sys.path.insert(0, HERE)
+    from ngram_subset_ref import SubsetRef
     dev = torch.device("xpu", 0)
-    sub = ns["SubsetRef"](a.model, a.ref_rows)
+    sub = SubsetRef(a.model, a.ref_rows)
     full = Exl3NgramHostTable(a.model)
     hdr, _ = _header(os.path.join(a.model, FILE))
     rows_per = [v["shape"][0] for k, v in sorted(((k, v) for k, v in hdr.items() if k.endswith(".trellis")),

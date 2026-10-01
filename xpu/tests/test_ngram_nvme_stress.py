@@ -8,7 +8,7 @@ The arm is chosen by EXL3_NVME_PUBLISH (store | atomic, read by the extension) a
 --seconds is stress-loop time, measured after setup (exposure_s). Every result is compared bit for bit with a pinned-RAM
 reference (the pinned tier's own gather/dequant kernel over one host chunk: a separate, atomic-free path). The reference
 holds only rows [0, --ref-rows) and every test id is drawn from that range, so the check costs ~2 GB of pinned RAM
-instead of the full 32.6 GB table (which left the dev window ~7 GB above its memory floor). The publish/wait handshake
+instead of the full 32.6 GB table (too much pinned memory for a 64 GB host). The publish/wait handshake
 under test writes the same buffers whatever the id values are. The extension's error word and the GPU wait count are
 checked against the number of lookups issued. Progress JSON is rewritten every 10 s so the exposure before a device
 loss survives the process.
@@ -30,62 +30,7 @@ ap.add_argument("--seed", type=int, default=0)
 a = ap.parse_args()
 
 
-class SubsetRef:
-    """Pinned-RAM reference over rows [0, rows): Exl3NgramHostTable's gather (ngram_gather_dequant) with one chunk."""
-
-    def __init__(self, model, rows):
-        from exl3xpu.moe_offload import ops, s64
-        path = os.path.join(model, FILE)
-        hdr, base = _header(path)
-        meta = hdr.pop("__metadata__", {}) or {}
-        if meta.get("format") != "exl3_ngram_trellis":
-            raise ValueError(f"{path}: not an exl3_ngram_trellis table ({meta.get('format')!r})")
-        shards, prefix = {}, None
-        for k, v in hdr.items():
-            m = re.match(r"(.*)\.shard_(\d+)\.trellis$", k)
-            if m:
-                shards[int(m.group(2))] = v
-                prefix = m.group(1)
-        if not shards or sorted(shards) != list(range(len(shards))):
-            raise ValueError(f"{path}: shard_N.trellis tensors missing or not contiguous")
-        self.words = shards[0]["shape"][1]
-        self.K = (self.words - 1) * 16 // 160
-        if self.K != int(meta.get("K", self.K)) or 1 + 160 * self.K // 16 != self.words:
-            raise ValueError(f"{path}: row width {self.words} does not match K={meta.get('K')}")
-        if any(shards[i]["shape"][1] != self.words for i in shards):
-            raise ValueError(f"{path}: shards differ in row width")
-        rb = self.words * 2
-        self.num_rows = min(rows, sum(shards[i]["shape"][0] for i in shards))
-        self.X = ops()
-        self.chunk = self.X.host_alloc(self.num_rows * rb)
-        mv = memoryview(self.chunk.numpy())
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            done = 0
-            for i in range(len(shards)):
-                if done >= self.num_rows:
-                    break
-                a0, _ = shards[i]["data_offsets"]
-                ln = min(shards[i]["shape"][0], self.num_rows - done) * rb
-                off = 0
-                while off < ln:
-                    n = os.preadv(fd, [mv[done * rb + off: done * rb + min(ln, off + (64 << 20))]], base + a0 + off)
-                    if n <= 0:
-                        raise IOError(f"{path}: short read")
-                    off += n
-                done += ln // rb
-        finally:
-            os.close(fd)
-        d = torch.device("xpu", torch.xpu.current_device())
-        self.head_bias = _read_small(path, base, hdr[f"{prefix}.head_bias"]).to(d, torch.float16).contiguous()
-        self.chunk_ptrs = torch.tensor([s64(self.chunk.data_ptr())], dtype=torch.int64, device=d)
-
-    def gather(self, ids):
-        flat = ids.reshape(-1).to(torch.long).contiguous()
-        out = torch.empty((*ids.shape, 160), dtype=torch.bfloat16, device=ids.device)
-        self.X.ngram_gather_dequant(flat, self.chunk_ptrs, self.num_rows, self.num_rows, self.words, self.K,
-                                    self.head_bias, out)
-        return out
+from ngram_subset_ref import SubsetRef  # noqa: E402  (tests dir is on sys.path as the script dir)
 
 dev = torch.device("xpu", 0)
 g = torch.Generator().manual_seed(a.seed)
