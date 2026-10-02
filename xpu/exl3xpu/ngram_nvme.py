@@ -150,6 +150,13 @@ class Exl3NgramNvmeTable(torch.nn.Module):
         # USM host buffers: the pointers are device-usable as they are
         self.slab_dev, self.req_dev, self.resp_dev, self.ctrl_dev = (s64(s.slab_ptr()), s64(s.req_ptr()),
                                                                       s64(s.resp_ptr()), s64(s.ctrl_ptr()))
+        # host USM ranges the GPU touches through this table, logged before any device work so a GPU fault address can
+        # be attributed to (or excluded from) them; req and ctrl are the targets of the atomic publish path
+        u = lambda p: p & ((1 << 64) - 1)
+        logger.info("EXL3 n-gram NVMe host USM pid=%d %s at %.3f: req [0x%x, +%d) ctrl [0x%x, +4096) resp [0x%x, +%d) "
+                    "slab [0x%x, +%d) publish=%s", os.getpid(), dev, time.time(), u(self.req_dev), s.io_bytes(),
+                    u(self.ctrl_dev), u(self.resp_dev), s.io_bytes(), u(self.slab_dev), s.slab_bytes(),
+                    os.environ.get("EXL3_NVME_PUBLISH", "store"))
         self.register_buffer("head_bias", head_bias.to(dev, torch.float16).contiguous(), persistent=False)
         self.register_buffer("chunk_ptrs", torch.tensor([self.slab_dev], dtype=torch.int64, device=dev), persistent=False)
         self.dseq = torch.zeros(4, dtype=torch.int32, device=dev)

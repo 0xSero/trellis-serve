@@ -34,6 +34,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -671,10 +672,71 @@ void ngram_hash_tokens(torch::Tensor tokens, torch::Tensor mult, torch::Tensor s
     }
 }
 
+namespace esn = sycl::ext::intel::esimd;
+namespace xe = sycl::ext::intel::experimental::esimd;
+
 // XPU entry points (raw pointers are USM host addresses; kernels on the current torch XPU stream).
-// Every GPU access to the shared host words is a system-scope atomic RMW: plain / atomic loads and stores to host USM
-// can sit in the GPU L3 between kernels of one in-order queue (no flush without a host-visible event), which hung the
-// back-to-back publish -> wait pair (host never saw req_seq) and could serve stale resp lines on graph replay.
+// Plain SYCL loads and stores to host USM can sit in the GPU L3 between kernels of one in-order queue (no flush without
+// a host-visible event), which hung the back-to-back publish -> wait pair (host never saw req_seq) and could serve stale
+// resp lines on graph replay. Two ways around it, selected by EXL3_NVME_PUBLISH (read once):
+//   store (default): the ids and both ctrl words are written with ESIMD LSC stores that bypass L1 and L3, each thread
+//     ending with a system-scope fence; req_n and then req_seq are written by one thread in a later kernel, i.e. after
+//     every payload store has completed on the in-order queue. No atomic reaches host memory.
+//   atomic: every GPU store to the shared host words is a system-scope atomic RMW (the original X008 path). On B70 hosts
+//     whose root ports lack PCIe AtomicOps (Arrow Lake client: AtomicOpsCtl ReqEn-) this path intermittently faults:
+//     xe CAT error, AccessType 2 (atomic) at a host address, fault response -EINVAL, card lost.
+static bool publish_atomic()
+{
+    static const bool a = [] {
+        const char* e = std::getenv("EXL3_NVME_PUBLISH");
+        bool atomic = e && std::string(e) == "atomic";
+        if (e && !atomic && std::string(e) != "store") throw std::runtime_error("EXL3_NVME_PUBLISH: store | atomic");
+        fprintf(stderr, "exl3xpu_ngram_nvme: publish via %s\n", atomic ? "system-scope atomic RMW" : "uncached ESIMD stores");
+        return atomic;
+    }();
+    return a;
+}
+
+struct NvmePubIdsK {
+    const int64_t* p64; const int32_t* p32; int64_t* req; int n;
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int base = (int) item.get_global_id(0) * 16;
+        esn::simd<uint32_t, 16> off8(0, 8);
+        esn::simd_mask<16> m = esn::simd<int32_t, 16>(base, 1) < n;
+        esn::simd<int64_t, 16> v;
+        if (p64) {
+            v = xe::lsc_gather<int64_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::none, xe::cache_hint::none,
+                               16>(p64 + base, off8, m);
+        } else {
+            esn::simd<uint32_t, 16> off4(0, 4);
+            esn::simd<int32_t, 16> w = xe::lsc_gather<int32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::none,
+                                                      xe::cache_hint::none, 16>(p32 + base, off4, m);
+            v = w;
+        }
+        xe::lsc_scatter<int64_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached,
+                        16>(req + base, off8, v, m);
+        esn::fence<esn::memory_kind::global, esn::fence_flush_op::none, esn::fence_scope::system>();
+    }
+};
+struct NvmePubCtrlK {
+    uint32_t* ctrl; uint32_t* ds; uint32_t n;
+    void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
+        esn::simd<uint32_t, 1> z(0);
+        // dseq is device memory, read and written as the atomic path's single_task does (plain), then read uncached by
+        // NvmeSpinK in a later kernel
+        uint32_t s = xe::lsc_gather<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::none,
+                                    xe::cache_hint::none>(ds, z)[0] + 1;
+        xe::lsc_scatter<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::none, xe::cache_hint::none>(
+            ds, z, esn::simd<uint32_t, 1>(s));
+        xe::lsc_scatter<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached>(
+            ctrl + C_N, z, esn::simd<uint32_t, 1>(n));
+        esn::fence<esn::memory_kind::global, esn::fence_flush_op::none, esn::fence_scope::system>();
+        xe::lsc_scatter<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached>(
+            ctrl + C_REQ, z, esn::simd<uint32_t, 1>(s));
+        esn::fence<esn::memory_kind::global, esn::fence_flush_op::none, esn::fence_scope::system>();
+    }
+};
+
 void nvme_publish(const at::Tensor& ids, int64_t req_dev, int64_t ctrl_dev, at::Tensor& dseq)
 {
     TORCH_CHECK(ids.is_xpu() && ids.is_contiguous(), "nvme_publish: ids");
@@ -682,6 +744,21 @@ void nvme_publish(const at::Tensor& ids, int64_t req_dev, int64_t ctrl_dev, at::
     int n = (int) ids.numel();
     auto& q = c10::xpu::getCurrentXPUStream(ids.device().index()).queue();
     int64_t* req = (int64_t*) req_dev;
+    uint32_t* ctrl = (uint32_t*) ctrl_dev;
+    uint32_t* ds = (uint32_t*) dseq.data_ptr<int>();
+    if (!publish_atomic())
+    {
+        if (n > 0)
+        {
+            TORCH_CHECK(ids.scalar_type() == at::kLong || ids.scalar_type() == at::kInt, "nvme_publish: ids int32/int64");
+            const int64_t* p64 = ids.scalar_type() == at::kLong ? ids.data_ptr<int64_t>() : nullptr;
+            const int32_t* p32 = ids.scalar_type() == at::kInt ? ids.data_ptr<int32_t>() : nullptr;
+            size_t g = (((size_t) n + 15) / 16 + 15) / 16 * 16;
+            q.parallel_for(sycl::nd_range<1>(g, 16), NvmePubIdsK{p64, p32, req, n});
+        }
+        q.parallel_for(sycl::nd_range<1>(1, 1), NvmePubCtrlK{ctrl, ds, (uint32_t) n});
+        return;
+    }
     if (n > 0)
     {
         size_t g = ((size_t) n + 255) / 256 * 256;
@@ -699,8 +776,6 @@ void nvme_publish(const at::Tensor& ids, int64_t req_dev, int64_t ctrl_dev, at::
                 sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system); });
         } else TORCH_CHECK(false, "nvme_publish: ids int32/int64");
     }
-    uint32_t* ctrl = (uint32_t*) ctrl_dev;
-    uint32_t* ds = (uint32_t*) dseq.data_ptr<int>();
     q.single_task([=]() {
         uint32_t s = ds[0] + 1;
         ds[0] = s;
@@ -715,8 +790,6 @@ void nvme_publish(const at::Tensor& ids, int64_t req_dev, int64_t ctrl_dev, at::
 // Host -> GPU direction: a system-scope atomic (even an RMW) spinning inside one kernel never observed the host's
 // done_seq store on B70 (served from the GPU cache; 400k iterations, 2.2 us each, past the host write).  The spin and
 // the resp read therefore use ESIMD LSC loads with L1+L3 uncached hints, which go to host memory every time.
-namespace esn = sycl::ext::intel::esimd;
-namespace xe = sycl::ext::intel::experimental::esimd;
 struct NvmeSpinK {
     const uint32_t* ctrl; const uint32_t* ds; int64_t* scratch; int64_t max_it;
     void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
