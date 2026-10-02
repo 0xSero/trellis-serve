@@ -4,7 +4,7 @@
 `_QSA_PREFILL_LOGITS_BUDGET_BYTES` (128 MiB). On XPU `qsa_mqa_prefill` falls back to `torch_qsa_mqa_prefill`, whose
 real peak is far larger than the logits: it materialises `scores[rows, keys, heads]` in fp32, a second tensor of the
 same size for `relu`, then the summed logits, the scaled logits, the column/validity masks and the masked result.
-With Flash-Next's 4 indexer heads a 2048-row chunk at a 64K context (~16K compressed keys) peaks near 1.3 GB instead of
+With Flash-Next's 4 indexer heads a 2048-row chunk at a 64K context (~16K compressed keys) peaked at 1,152 MiB instead of
 128 MiB, which exceeded a pipeline stage's free memory serving Flash-Next on two B70s (observed: OOM on a
 124 MiB logits allocation during a 64K prefill with a concurrent request).
 
@@ -25,9 +25,25 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_BUDGET = int(os.environ.get("EXL3_QSA_PREFILL_BUDGET_BYTES", str(128 << 20)))
-if _BUDGET <= 0:
-    raise ValueError("EXL3_QSA_PREFILL_BUDGET_BYTES must be positive")
+_DEFAULT_BUDGET = 128 << 20
+
+
+def _budget() -> int:
+    """A malformed setting falls back to the default with an error rather than disabling the patch."""
+    raw = os.environ.get("EXL3_QSA_PREFILL_BUDGET_BYTES", str(_DEFAULT_BUDGET))
+    try:
+        if int(raw) > 0:
+            return int(raw)
+    except ValueError:
+        pass
+    import sys as _sys
+    print(f"EXL3 qsa: ignoring EXL3_QSA_PREFILL_BUDGET_BYTES={raw!r}, using {_DEFAULT_BUDGET}", file=_sys.stderr,
+          flush=True)
+    logger.error("exl3xpu: ignoring EXL3_QSA_PREFILL_BUDGET_BYTES=%r, using %d", raw, _DEFAULT_BUDGET)
+    return _DEFAULT_BUDGET
+
+
+_BUDGET = _budget()
 # Logits-sized fp32 allowance besides the two [rows, keys, heads] tensors (scores and relu output). Not an exact peak
 # model: the summed, scaled and masked logits do not all coexist, and the bool masks are 1 byte each, so 4 is a
 # conservative allowance. Not covered: the fp32 copies of q (rows x heads x 128) and k (keys x 128), backend
