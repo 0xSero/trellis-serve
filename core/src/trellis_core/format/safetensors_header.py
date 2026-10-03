@@ -32,6 +32,8 @@ def parse_header(raw: bytes, file: str = "") -> ShardHeader:
     tensors = {}
     for name, entry in doc.items():
         begin, end = entry["data_offsets"]
+        if end < begin:
+            raise FormatError(f"{file}: {name}: data_offsets [{begin}, {end}) is reversed")
         tensors[name] = TensorInfo(name=name, dtype=entry["dtype"], shape=tuple(entry["shape"]),
                                    file=file, nbytes=end - begin)
     return ShardHeader(file=file, metadata=metadata, tensors=tensors)
