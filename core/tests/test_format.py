@@ -53,3 +53,12 @@ def test_header_parser_reads_names_shapes_and_sizes():
     assert h.metadata == {"format": "pt"}
     assert h.tensors["m.trellis"].shape == (8, 8, 48) and h.tensors["m.trellis"].nbytes == 6144
     assert struct.calcsize("<Q") == 8
+
+
+def test_header_parser_rejects_a_reversed_byte_range():
+    empty = {"w": {"dtype": "F16", "shape": [0], "data_offsets": [4, 4]}}
+    parsed = parse_header(json.dumps(empty).encode(), "shard.safetensors")
+    assert parsed.tensors["w"].nbytes == 0
+    raw = json.dumps({"w": {"dtype": "F16", "shape": [2], "data_offsets": [10, 4]}}).encode()
+    with pytest.raises(FormatError, match="reversed"):
+        parse_header(raw, "shard.safetensors")
