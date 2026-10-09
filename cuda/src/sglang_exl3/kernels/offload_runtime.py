@@ -66,6 +66,60 @@ class OffloadRuntime:
         self.prefill_copied = np.zeros(self.L, dtype=np.int64)
         self.prefill_resident = np.zeros(self.L, dtype=np.int64)
         self.prefill_calls = np.zeros(self.L, dtype=np.int64)
+        # decode routing per (layer, expert) for the RAM-tier pinner (kernels/offload_pin.py); column E counts dropped ids
+        self.route_counts = torch.zeros((self.L, self.E + 1), dtype=torch.int32, device=dev)
+        self._ones = torch.ones(4096, dtype=torch.int32, device=dev)
+        self.pos = None                                    # [L, E + 1] original id -> stored position (sorted store)
+        self.pinned_bands = {}                             # layer -> (lo, hi) registered bytes of the bank (offload_pin)
+        self.mask_tau = 0.0
+
+    def _stage(self, layer: int, stg: torch.Tensor, d0: int, bank: torch.Tensor, s0: int, n: int) -> None:
+        """stg[d0:d0+n] <- bank[s0:s0+n] (records) as cudaMemcpyAsync calls that never span the edge of the layer's
+        registered (pinned) band: a copy from partly registered host memory is rejected (cudaErrorInvalidValue)."""
+        band = self.pinned_bands.get(layer)
+        if band is None:
+            stg[d0:d0 + n].copy_(bank[s0:s0 + n], non_blocking=True)
+            return
+        rec = self.lay.record_bytes
+        sb, db = bank.view(-1), stg.view(-1)
+        a, z = s0 * rec, (s0 + n) * rec
+        cuts = sorted({a, z, *(c for c in band if a < c < z)})
+        for u, v in zip(cuts, cuts[1:]):
+            db[(d0 - s0) * rec + u:(d0 - s0) * rec + v].copy_(sb[u:v], non_blocking=True)
+
+    def set_mask(self, tau: float, band_pos: dict) -> None:
+        """Lossy decode option (SGLANG_EXL3_OFFLOAD_MASK_TAU > 0): a decode pick whose expert is in neither fast tier
+        (not resident in the VRAM cache, not in the layer's pinned RAM band) and whose routing weight is below tau is
+        dropped and the kept weights renormalised, so cold experts are not faulted in from the file. Prefill is exact."""
+        self.mask_tau = tau
+        lo = torch.zeros(self.L, dtype=torch.int64)
+        hi = torch.zeros(self.L, dtype=torch.int64)
+        for l, (a, b) in band_pos.items():
+            lo[l], hi[l] = a, b
+        self.band_lo, self.band_hi = lo.to(self.device), hi.to(self.device)
+        self.mask_stats = torch.zeros(2, dtype=torch.int64, device=self.device)     # dropped picks, valid picks
+
+    def _mask_cold(self, layer: int, ids: torch.Tensor, w: torch.Tensor):
+        E = self.E
+        t = ids.to(torch.int64)
+        valid = t < E
+        safe = torch.where(valid, t, torch.zeros_like(t))
+        resident = self.cache.slot_of[layer * E + safe] >= 0
+        pinned = (safe >= self.band_lo[layer]) & (safe < self.band_hi[layer])
+        drop = valid & ~resident & ~pinned & (w < self.mask_tau)
+        keep_w = torch.where(drop, torch.zeros_like(w), w)
+        s = keep_w.sum(-1, keepdim=True)
+        w2 = torch.where(s > 0, keep_w * (w.sum(-1, keepdim=True) / s.clamp_min(1e-12)), w)
+        ids2 = torch.where(drop, torch.full_like(t, E), t).to(ids.dtype)
+        self.mask_stats[0] += drop.sum()
+        self.mask_stats[1] += valid.sum()
+        return ids2, w2
+
+    def set_order(self, pos) -> None:
+        """Serve a store whose records are in `pos` order (pos[l, e] = stored position of original expert e). Column E
+        keeps the drop sentinel. Routing counts stay in original ids."""
+        p = torch.as_tensor(np.asarray(pos), dtype=torch.int32)
+        self.pos = torch.cat([p, torch.full((self.L, 1), self.E, dtype=torch.int32)], 1).to(self.device).contiguous()
 
     # ---- forward
     def forward(self, layer: int, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
@@ -76,6 +130,17 @@ class OffloadRuntime:
         T = x.shape[0]
         if T == 0:
             return torch.empty_like(x)
+        if T < self.prefill_min_tokens or torch.cuda.is_current_stream_capturing():   # decode only: prefill touches all
+            flat = topk_ids.reshape(-1)
+            if flat.numel() <= self._ones.numel():
+                flat = torch.where((flat < 0) | (flat > self.E), torch.full_like(flat, self.E), flat).to(torch.int64)
+                self.route_counts[layer].index_add_(0, flat, self._ones[: flat.numel()])
+        if self.pos is not None:                           # original ids -> stored positions (graph-safe gather)
+            t = topk_ids.to(torch.int64)
+            t = torch.where((t < 0) | (t > self.E), torch.full_like(t, self.E), t)
+            topk_ids = self.pos[layer][t]
+        if self.mask_tau > 0 and (T < self.prefill_min_tokens or torch.cuda.is_current_stream_capturing()):
+            topk_ids, topk_weights = self._mask_cold(layer, topk_ids, topk_weights.float())
         if self.fused_decode and force != "prefill" and T * topk_ids.shape[1] <= 1024 and \
                 marlin_moe.moe_block_size(T, topk_ids.shape[1], self.E) == 8 and routing is None and \
                 (force == "decode" or torch.cuda.is_current_stream_capturing() or T < self.prefill_min_tokens):
@@ -111,7 +176,7 @@ class OffloadRuntime:
                 brk = np.nonzero(np.diff(miss) != 1)[0] + 1
                 for run in np.split(miss, brk):
                     a, z = int(run[0]), int(run[-1]) + 1
-                    stg[a:z].copy_(bank[a:z], non_blocking=True)
+                    self._stage(layer, stg, a, bank, a, z - a)
             self.ready[b].record(self.copy_stream)
         self._pending[layer] = b
 
@@ -149,7 +214,7 @@ class OffloadRuntime:
                 brk = np.nonzero(np.diff(miss) != 1)[0] + 1
                 for run in np.split(miss, brk):
                     a, z = int(run[0]), int(run[-1]) + 1
-                    stg[a:z].copy_(bank[lo + a:lo + z], non_blocking=True)
+                    self._stage(layer, stg, a, bank, lo + a, z - a)
             self.ready[b].record(self.copy_stream)
         self._pending[(layer, part)] = b
 
@@ -255,6 +320,8 @@ class OffloadRuntime:
     def stats(self, reset: bool = False) -> dict:
         s = self.cache.stats.cpu().numpy()
         out = {"decode_hits": s[:, 0].tolist(), "decode_misses": s[:, 1].tolist(),
+               "masked_picks": int(self.mask_stats[0]) if self.mask_tau > 0 else 0,
+               "masked_of": int(self.mask_stats[1]) if self.mask_tau > 0 else 0,
                "decode_hit_rate": float(s[:, 0].sum() / max(1, s.sum())),
                "prefill_copied": self.prefill_copied.tolist(), "prefill_resident": self.prefill_resident.tolist(),
                "prefill_calls": self.prefill_calls.tolist(), "slots": self.cache.S,
