@@ -10,7 +10,9 @@ weight iterator with `is_offloaded_expert_key(name)`.
 Knobs (env): SGLANG_EXL3_EXPERT_CACHE_GB (slot-pool byte budget, GB) or SGLANG_EXL3_OFFLOAD_SLOTS (slots) or
 SGLANG_EXL3_OFFLOAD_CACHE_GB (default 8 GB),
 SGLANG_EXL3_OFFLOAD_PREFILL_MIN (tokens from which the staged prefill path is used, default 192 = K05 crossover),
-SGLANG_EXL3_OFFLOAD_STATS_EVERY (log per-layer hit rates every N decode forwards of layer 0; 0 = off).
+SGLANG_EXL3_OFFLOAD_STATS_EVERY (log per-layer hit rates every N decode forwards of layer 0; 0 = off),
+SGLANG_EXL3_OFFLOAD_STORE=hmm + SGLANG_EXL3_OFFLOAD_STORE_DIR (the expert store as one file in that directory, read by
+the GPU through HMM instead of pinned RAM: see kernels/offload_store.py; the directory must be on a local NVMe SSD).
 """
 from __future__ import annotations
 
@@ -83,18 +85,64 @@ def get_runtime(config, num_experts: int, hidden: int, inter: int, bits: int, co
             layers.add(int(m.group(2))); prefix = m.group(1)
     layers = sorted(layers)
     model_dir = getattr(config, "model_path", None) or config.path
-    store = HostExpertStore(model_dir, layers, num_experts, hidden, inter, bits, prefix=prefix)
+    store_path, pos = None, None
+    if os.environ.get("SGLANG_EXL3_OFFLOAD_STORE", "pinned") == "hmm":
+        d = os.environ.get("SGLANG_EXL3_OFFLOAD_STORE_DIR", "/nvx")
+        store_path = os.path.join(d, f"experts-{os.path.basename(os.path.normpath(model_dir))}-k{bits}.bin")
+    store = HostExpertStore(model_dir, layers, num_experts, hidden, inter, bits, prefix=prefix, store_path=store_path)
     st = store.load()
+    if store_path:
+        logger.info("EXL3 offload: expert store %s (%s, %.1f GB, read through HMM: page cache = RAM tier)", store_path,
+                    "mapped" if store.prebuilt else "written", store.L * store.stride / 1e9)
+        # popularity-ordered copy of the store (experts renumbered per layer, most routed first) so that the pinned RAM
+        # tier is one contiguous band per layer; ids are remapped at the runtime's entry (OffloadRuntime.pos)
+        from ..kernels import offload_pin as op
+        profile = store_path + ".profile.npy"
+        sorted_path = store_path[:-4] + ".sorted.bin"
+        if os.environ.get("SGLANG_EXL3_OFFLOAD_SORT", "auto") != "0":
+            score = op.load_profile(profile, store.L, num_experts)
+            pos = op.sorted_order(sorted_path, store._meta)
+            if score is not None and (pos is None or os.environ.get("SGLANG_EXL3_OFFLOAD_SORT") == "repack"):
+                pos = op.order_from_profile(score)
+                secs = op.repack_store(store, sorted_path, pos)
+                logger.info("EXL3 offload: store repacked by routing profile -> %s in %.1f s", sorted_path, secs)
+            if pos is not None:
+                store.release()
+                store = HostExpertStore(model_dir, layers, num_experts, hidden, inter, bits, prefix=prefix,
+                                        store_path=sorted_path)
+                if not store.prebuilt:
+                    raise RuntimeError(f"{sorted_path}: sorted store marker does not match its layout")
+                logger.info("EXL3 offload: serving the popularity-ordered store %s", sorted_path)
     parts = int(os.environ.get("SGLANG_EXL3_OFFLOAD_STAGING_PARTS", "1"))
     staging_bytes = 2 * (-(-num_experts // parts)) * store.lay.record_bytes
     slots = _slots_from_env(store.lay.record_bytes, staging_bytes)
+    ps = {}
+    if store_path and pos is not None:
+        from ..kernels.offload_pin import load_profile, pin_budget_bytes, pin_static
+        pb = pin_budget_bytes(store.L * store.stride)
+        score = load_profile(store_path + ".profile.npy", store.L, num_experts)
+        if pb > 0 and score is not None:
+            ps = pin_static(store, pb, score, pos, slots)
+            logger.info("EXL3 offload: pinned RAM tier from the profile: %d experts (%.1f GB) in %d runs, %.1f s "
+                        "(top %d left to the VRAM cache, %d register errors)", ps["pinned"], ps["pinned_gb"], ps["runs"],
+                        ps["seconds"], ps["skipped_top"], ps["errors"])
     rt = OffloadRuntime(store, slots, codebook, prefill_min_tokens=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_MIN", "192")),
                         staging_parts=int(os.environ.get("SGLANG_EXL3_OFFLOAD_STAGING_PARTS", "1")),
                         prefill_subchunk=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_SUBCHUNK", str(1 << 30))))
-    logger.info("EXL3 offload: %d layers x %d experts pinned (%.1f GB) in %.1fs (read wait %.1fs, relayout %.1fs, "
+    if pos is not None:
+        rt.set_order(pos)
+    if ps.get("bands"):
+        rt.pinned_bands = ps["bands"]             # staged prefill copies must not cross a registration edge
+    rt.set_mask(float(os.environ.get("SGLANG_EXL3_OFFLOAD_MASK_TAU", "0")), ps.get("band_pos", {}))
+    logger.info("EXL3 offload: %d layers x %d experts " + ("in the file store" if store_path else "pinned") + " (%.1f GB) in %.1fs (read wait %.1fs, relayout %.1fs, "
                 "register %.1fs); cache %d slots (%.1f GB)", store.L, num_experts, store.L * store.bank_bytes / 1e9,
                 st.seconds_total, st.seconds_read_wait, st.seconds_relayout, st.seconds_register, slots,
                 slots * store.lay.record_bytes / 1e9)
+    if store_path:
+        from ..kernels.offload_pin import StorePinner, lock_budget_bytes
+        budget = 0 if pos is not None else lock_budget_bytes(store.L * store.stride)   # 0 (default): profile only
+        rt.pinner = StorePinner(store, rt, budget, store_path + ".profile.npy",
+                                float(os.environ.get("SGLANG_EXL3_OFFLOAD_LOCK_INTERVAL_S", "20"))).start()
     _RUNTIMES[key] = rt
     return rt
 
@@ -145,6 +193,11 @@ class Exl3OffloadMoEMethod(Exl3MoEMethod):
         except Exception:  # pragma: no cover
             capture = False
         # capture mode (or stream capture): decode path only - no host sync, graph-safe
+        if getattr(rt, "pinner", None) is not None and not rt.pinner.serving.is_set():
+            if capture or torch.cuda.is_current_stream_capturing():
+                rt.pinner.seen_capture = True
+            elif getattr(rt.pinner, "seen_capture", False):
+                rt.pinner.serving.set()           # first eager forward after graph capture: serving has begun
         y = rt.forward(layer.exl3_store_index, x, topk_ids, topk_weights, force="decode" if capture else None)
         if (os.environ.get("SGLANG_EXL3_OFFLOAD_LOG_PREFILL", "1") == "1" and layer.exl3_store_index == 0
                 and x.shape[0] >= rt.prefill_min_tokens and not torch.cuda.is_current_stream_capturing()):
@@ -152,9 +205,9 @@ class Exl3OffloadMoEMethod(Exl3MoEMethod):
             # (decode runs inside CUDA graphs, where no Python code executes)
             s = rt.stats(reset=True)
             if sum(s["decode_hits"]) + sum(s["decode_misses"]):
-                logger.info("EXL3 offload: decode hit rate %.4f since last prefill (%d hits, %d misses), resident %d/%d",
+                logger.info("EXL3 offload: decode hit rate %.4f since last prefill (%d hits, %d misses), resident %d/%d%s",
                             s["decode_hit_rate"], sum(s["decode_hits"]), sum(s["decode_misses"]), s["resident"],
-                            s["slots"])
+                            s["slots"], f", masked {s['masked_picks']}/{s['masked_of']} picks" if s["masked_of"] else "")
         if self._stats_every and layer.exl3_store_index == 0 and x.shape[0] < rt.prefill_min_tokens \
                 and not torch.cuda.is_current_stream_capturing():
             self._calls += 1

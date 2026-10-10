@@ -11,6 +11,13 @@ Load path (one copy of the experts is kept):
     layers are still being read (pin-after-fill: registering first would fault and zero every page).
 release() unregisters every layer BEFORE the mapping is unmapped (a stale UVA registration over a recycled VA range
 corrupts later mappings: seen by the integration lane).
+
+File-backed store (store_path, SGLANG_EXL3_OFFLOAD_STORE=hmm): the same record layout in ONE file on a local NVMe
+filesystem, mapped MAP_SHARED and never registered. The GPU reads it through HMM (open kernel modules, "Addressing Mode:
+HMM"): a record whose pages are in the page cache streams over PCIe like pinned memory, one that is not is faulted in from
+the file. The OS page cache is the RAM tier (sized by whatever RAM is free, LRU) and the file is the NVMe tier, so the
+host needs neither the 45.8 GB nor any locked memory. The first start writes the file with the normal loader (relayout
+into the shared mapping) and then a marker with the layout; later starts map it read-only and skip the load.
 """
 from __future__ import annotations
 
@@ -57,7 +64,8 @@ class HostExpertStore:
     """layers: checkpoint layer ids to load (store index i = layers[i]); prefix: key prefix of those layers."""
 
     def __init__(self, model_dir: str, layers: list[int], num_experts: int, hidden: int, inter: int, bits: int = 3,
-                 prefix: str = "model.language_model.layers.", register: bool = True, threads: int = 8, readers: int = 4):
+                 prefix: str = "model.language_model.layers.", register: bool = True, threads: int = 8, readers: int = 4,
+                 store_path: str | None = None):
         if bits != 3:
             raise NotImplementedError("HostExpertStore: fast relayout implemented for K=3 experts only")
         self.model_dir, self.layers, self.E = model_dir, list(layers), num_experts
@@ -65,12 +73,38 @@ class HostExpertStore:
         self.L = len(self.layers)
         self.bank_bytes = num_experts * self.lay.record_bytes
         self.stride = (self.bank_bytes + _PAGE - 1) // _PAGE * _PAGE
-        # private anonymous mapping (page aligned, lazily backed) with transparent huge pages: 2 MB first-touch faults
-        # instead of 4 KB ones (a shared anonymous mapping is shmem: 4 KB pages, ~11 M zeroing faults for 46 GB)
-        self._mm = mmap.mmap(-1, self.L * self.stride, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-        if hasattr(mmap, "MADV_HUGEPAGE"):
-            self._mm.madvise(mmap.MADV_HUGEPAGE)
-        self.buf = torch.frombuffer(self._mm, dtype=torch.uint8)
+        self.store_path, self.prebuilt, self._fd = store_path, False, None
+        if store_path:
+            self._marker = store_path + ".json"
+            self._meta = {"layers": self.layers, "experts": num_experts, "record_bytes": self.lay.record_bytes,
+                          "stride": self.stride, "bits": bits, "model": os.path.basename(os.path.normpath(model_dir))}
+            nbytes = self.L * self.stride
+            try:
+                m = json.load(open(self._marker))             # a sorted store's marker adds its order (offload_pin)
+                done = {k: m.get(k) for k in self._meta} == self._meta and os.path.getsize(store_path) == nbytes
+            except (OSError, ValueError):
+                done = False
+            if done:
+                self._fd = os.open(store_path, os.O_RDONLY)
+                self._mm = mmap.mmap(self._fd, nbytes, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+                self.prebuilt = True
+            else:
+                if os.path.exists(self._marker):
+                    os.unlink(self._marker)
+                self._fd = os.open(store_path, os.O_RDWR | os.O_CREAT, 0o644)
+                os.ftruncate(self._fd, nbytes)
+                self._mm = mmap.mmap(self._fd, nbytes, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+            register = False                                   # never pinned: the GPU reads the file pages via HMM
+        else:
+            # private anonymous mapping (page aligned, lazily backed) with transparent huge pages: 2 MB first-touch faults
+            # instead of 4 KB ones (a shared anonymous mapping is shmem: 4 KB pages, ~11 M zeroing faults for 46 GB)
+            self._mm = mmap.mmap(-1, self.L * self.stride, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+            if hasattr(mmap, "MADV_HUGEPAGE"):
+                self._mm.madvise(mmap.MADV_HUGEPAGE)
+        import warnings
+        with warnings.catch_warnings():                        # a read-only file mapping is a non-writable buffer
+            warnings.simplefilter("ignore", UserWarning)
+            self.buf = torch.frombuffer(self._mm, dtype=torch.uint8)
         self.prefix, self.register, self.threads, self.readers = prefix, register, threads, readers
         self._registered = [False] * self.L
         self._key = re.compile(rf"^{re.escape(prefix)}(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.(trellis|suh|svh)$")
@@ -132,6 +166,8 @@ class HostExpertStore:
         return base, 1, size, size
 
     def load(self, group_bytes: int = 1 << 30, index_file: str = "model.safetensors.index.json") -> LoadStats:
+        if self.prebuilt:                                      # file store written by an earlier start: nothing to read
+            return self.stats
         t0 = time.time()
         st = self.stats
         wm = json.load(open(os.path.join(self.model_dir, index_file)))["weight_map"]
@@ -249,6 +285,13 @@ class HostExpertStore:
         del bounce
         if any(r != 0 for r in remaining):
             raise ValueError("HostExpertStore: incomplete layers after load")
+        if self.store_path:                                    # durable before the marker says it is complete
+            self._mm.flush()
+            os.fsync(self._fd)
+            with open(self._marker + ".tmp", "w") as f:
+                json.dump(self._meta, f)
+            os.replace(self._marker + ".tmp", self._marker)
+            st.seconds_total = time.time() - t0
         return st
 
     def release(self) -> None:
@@ -261,6 +304,12 @@ class HostExpertStore:
             self._mm.close()
         except BufferError:  # a view is still alive somewhere: leave the (now unregistered) mapping to the GC
             pass
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
 
     def __del__(self):
         try:
